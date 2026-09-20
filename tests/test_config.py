@@ -26,3 +26,11 @@ class ConfigTests(unittest.TestCase):
         path = self.write({"routing": {"task_routes": {"chat": ["missing"]}}, "providers": [{"name": "local", "kind": "ollama", "base_url": "http://localhost", "model": "llama"}]})
         with self.assertRaises(ConfigError):
             load_config(path)
+
+    def test_rejects_invalid_integer_settings_with_config_error(self) -> None:
+        path = self.write({
+            "server": {"port": "8080"},
+            "providers": [{"name": "local", "kind": "ollama", "base_url": "http://localhost", "model": "llama"}],
+        })
+        with self.assertRaises(ConfigError):
+            load_config(path)

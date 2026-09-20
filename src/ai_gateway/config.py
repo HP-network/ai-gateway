@@ -18,6 +18,12 @@ def _number(value: Any, name: str, *, minimum: float = 0) -> float:
     return float(value)
 
 
+def _integer(value: Any, name: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ConfigError(f"{name} must be an integer >= {minimum}")
+    return value
+
+
 def load_config(path: str | Path) -> GatewayConfig:
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -38,7 +44,7 @@ def load_config(path: str | Path) -> GatewayConfig:
 
     server = ServerConfig(
         host=str(server_raw.get("host", "0.0.0.0")),
-        port=int(server_raw.get("port", 8080)),
+        port=_integer(server_raw.get("port", 8080), "server.port", minimum=1),
         api_key=_secret(server_raw.get("api_key"), server_raw.get("api_key_env")),
         request_timeout_seconds=_number(server_raw.get("request_timeout_seconds", 45), "server.request_timeout_seconds", minimum=0.1),
     )
@@ -55,7 +61,7 @@ def load_config(path: str | Path) -> GatewayConfig:
         task_routes[task] = tuple(names)
     routing = RoutingConfig(
         default_model=str(routing_raw.get("default_model", "auto")),
-        max_retries=int(routing_raw.get("max_retries", 2)),
+        max_retries=_integer(routing_raw.get("max_retries", 2), "routing.max_retries"),
         failure_cooldown_seconds=_number(routing_raw.get("failure_cooldown_seconds", 30), "routing.failure_cooldown_seconds"),
         task_routes=task_routes,
     )
@@ -83,14 +89,22 @@ def load_config(path: str | Path) -> GatewayConfig:
             model=model,
             api_key=_secret(item.get("api_key"), item.get("api_key_env")),
             timeout_seconds=_number(item.get("timeout_seconds", server.request_timeout_seconds), f"provider {name} timeout_seconds", minimum=0.1),
-            priority=int(item.get("priority", 0)),
-            weight=max(1, int(item.get("weight", 1))),
-            headers={str(key): str(value) for key, value in (item.get("headers", {}) or {}).items()},
+            priority=_integer(item.get("priority", 0), f"provider {name} priority"),
+            weight=max(1, _integer(item.get("weight", 1), f"provider {name} weight", minimum=1)),
+            headers=_headers(item.get("headers", {}), name),
         ))
     unknown_routes = {name for route in task_routes.values() for name in route if name not in names}
     if unknown_routes:
         raise ConfigError(f"task route references unknown providers: {', '.join(sorted(unknown_routes))}")
     return GatewayConfig(server, routing, tuple(providers))
+
+
+def _headers(value: Any, provider_name: str) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError(f"provider {provider_name} headers must be an object")
+    return {str(key): str(item) for key, item in value.items()}
 
 
 def _secret(value: Any, env_name: Any) -> str | None:
