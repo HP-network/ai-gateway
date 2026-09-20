@@ -159,7 +159,7 @@ def config_from_env() -> GatewayConfig:
         raise ConfigError("AI_GATEWAY_PORT must be between 1 and 65535")
     return GatewayConfig(
         server=ServerConfig(
-            host=os.environ.get("AI_GATEWAY_HOST", "0.0.0.0"),
+            host=os.environ.get("AI_GATEWAY_HOST", "127.0.0.1"),
             port=port,
             api_key=os.environ.get("AI_GATEWAY_API_KEY") or None,
             request_timeout_seconds=_env_number("AI_GATEWAY_TIMEOUT", 45.0, minimum=0.1),

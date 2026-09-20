@@ -40,6 +40,7 @@ class ConfigTests(unittest.TestCase):
             config = config_from_env()
         self.assertEqual(config.providers[0].name, "openai")
         self.assertEqual(config.providers[0].api_key, "openai-secret")
+        self.assertEqual(config.server.host, "127.0.0.1")
         self.assertEqual(config.server.port, 8080)
 
     def test_environment_mode_keeps_ollama_as_local_fallback(self) -> None:

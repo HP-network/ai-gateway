@@ -27,7 +27,7 @@ pip install .
 ai-gateway
 ```
 
-The gateway listens on port `8080`. Send the same request you already send to OpenAI:
+The local process listens on `127.0.0.1:8080` by default. Send the same request you already send to OpenAI:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
