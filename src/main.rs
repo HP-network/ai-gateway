@@ -31,7 +31,7 @@ use tokio::{
 use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
 use tracing::{error, info};
 
-const VERSION: &str = "0.8.0";
+const VERSION: &str = "0.9.0";
 const MAX_BODY_BYTES: usize = 2_000_000;
 
 #[derive(Clone)]
@@ -85,6 +85,68 @@ struct ProviderConfig {
     input_price_per_million: f64,
     output_price_per_million: f64,
     headers: HashMap<String, String>,
+}
+
+#[derive(Clone, Copy)]
+struct ProviderPreset {
+    name: &'static str,
+    kind: &'static str,
+    base_url: &'static str,
+    model: &'static str,
+}
+
+fn provider_preset(name: &str) -> Option<ProviderPreset> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "openai" => Some(ProviderPreset {
+            name: "openai",
+            kind: "openai-compatible",
+            base_url: "https://api.openai.com/v1",
+            model: "gpt-4o-mini",
+        }),
+        "openrouter" => Some(ProviderPreset {
+            name: "openrouter",
+            kind: "openai-compatible",
+            base_url: "https://openrouter.ai/api/v1",
+            model: "openai/gpt-4o-mini",
+        }),
+        "deepseek" => Some(ProviderPreset {
+            name: "deepseek",
+            kind: "openai-compatible",
+            base_url: "https://api.deepseek.com/v1",
+            model: "deepseek-chat",
+        }),
+        "siliconflow" => Some(ProviderPreset {
+            name: "siliconflow",
+            kind: "openai-compatible",
+            base_url: "https://api.siliconflow.cn/v1",
+            model: "deepseek-ai/DeepSeek-V3",
+        }),
+        "anthropic" => Some(ProviderPreset {
+            name: "anthropic",
+            kind: "anthropic",
+            base_url: "https://api.anthropic.com",
+            model: "claude-3-5-haiku-latest",
+        }),
+        "gemini" => Some(ProviderPreset {
+            name: "gemini",
+            kind: "gemini",
+            base_url: "https://generativelanguage.googleapis.com",
+            model: "gemini-2.0-flash",
+        }),
+        "ollama" => Some(ProviderPreset {
+            name: "ollama",
+            kind: "ollama",
+            base_url: "http://127.0.0.1:11434",
+            model: "llama3.2",
+        }),
+        "openai-compatible" => Some(ProviderPreset {
+            name: "openai-compatible",
+            kind: "openai-compatible",
+            base_url: "https://api.openai.com/v1",
+            model: "gpt-4o-mini",
+        }),
+        _ => None,
+    }
 }
 
 impl ProviderConfig {
@@ -1808,12 +1870,14 @@ fn admin_allowed(state: &AppState, headers: &HeaderMap) -> Result<bool> {
     if let Some(expected) = state.config.server.admin_api_key.as_deref() {
         return Ok(value.is_some_and(|value| constant_time_eq(value, expected)));
     }
-    Ok(state
-        .config
-        .server
-        .api_key
-        .as_deref()
-        .is_some_and(|expected| value.is_some_and(|value| constant_time_eq(value, expected))))
+    if let Some(expected) = state.config.server.api_key.as_deref() {
+        return Ok(value.is_some_and(|value| constant_time_eq(value, expected)));
+    }
+    Ok(is_loopback_host(&state.config.server.host))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 fn api_allowed(
@@ -2437,7 +2501,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "ai-gateway {VERSION}\n\nUsage:\n  ai-gateway [--config <path>]\n  ai-gateway init\n  ai-gateway check-config [--config <path>]\n  ai-gateway --version\n  ai-gateway --help\n\nQuick start:\n  ai-gateway init              create a starter .env file\n  ai-gateway check-config      validate providers before binding a port\n  ai-gateway                   start the gateway\n\nEnvironment mode accepts AI_GATEWAY_UPSTREAM_* for one OpenAI-compatible\nprovider, or auto-discovers OPENAI_*, ANTHROPIC_*, GEMINI_*, and OLLAMA_* settings."
+            "ai-gateway {VERSION}\n\nUsage:\n  ai-gateway [--config <path>]\n  ai-gateway init [--provider <name>]\n  ai-gateway doctor [--config <path>]\n  ai-gateway check-config [--config <path>]\n  ai-gateway --version\n  ai-gateway --help\n\nQuick start:\n  ai-gateway init --provider openrouter\n  ai-gateway doctor\n  ai-gateway\n\nProvider presets: openai, openrouter, deepseek, siliconflow, anthropic, gemini, ollama.\nSet AI_GATEWAY_UPSTREAM_PROVIDER and AI_GATEWAY_UPSTREAM_API_KEY for a preset, or use\nAI_GATEWAY_UPSTREAM_* for any OpenAI-compatible provider and auto-discover\nOPENAI_*, ANTHROPIC_*, GEMINI_*, and OLLAMA_* settings."
         );
         return Ok(());
     }
@@ -2446,7 +2510,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if args.iter().any(|arg| arg == "init") {
-        init_dotenv(FsPath::new(".env"))?;
+        let provider = option_value(&args, "--provider").unwrap_or("openai");
+        init_dotenv(FsPath::new(".env"), provider)?;
         return Ok(());
     }
     let config_path = args
@@ -2454,6 +2519,10 @@ async fn main() -> Result<()> {
         .find(|window| window[0] == "--config")
         .map(|window| window[1].as_str());
     let config = load_config(config_path)?;
+    if args.iter().any(|arg| arg == "doctor") {
+        print_doctor(&config);
+        return Ok(());
+    }
     if args.iter().any(|arg| arg == "check-config") {
         println!(
             "{}",
@@ -2627,12 +2696,25 @@ fn parse_file_config(path: &FsPath) -> Result<Config> {
 
 fn env_config() -> Result<Config> {
     let mut providers = Vec::new();
-    let upstream_kind =
-        env_nonempty("AI_GATEWAY_UPSTREAM_KIND").unwrap_or_else(|| "openai-compatible".to_owned());
+    let preset = match env_nonempty("AI_GATEWAY_UPSTREAM_PROVIDER") {
+        Some(name) => Some(provider_preset(&name).ok_or_else(|| {
+            anyhow!(
+                "AI_GATEWAY_UPSTREAM_PROVIDER '{name}' is unknown; choose openai, openrouter, deepseek, siliconflow, anthropic, gemini, or ollama"
+            )
+        })?),
+        None => None,
+    };
+    let upstream_kind = env_nonempty("AI_GATEWAY_UPSTREAM_KIND")
+        .or_else(|| preset.map(|value| value.kind.to_owned()))
+        .unwrap_or_else(|| "openai-compatible".to_owned());
     let upstream_key = env_nonempty("AI_GATEWAY_UPSTREAM_API_KEY");
-    let upstream_model = env_nonempty("AI_GATEWAY_UPSTREAM_MODEL");
-    let upstream_configured =
-        upstream_key.is_some() || (upstream_kind == "ollama" && upstream_model.is_some());
+    let upstream_model = env_nonempty("AI_GATEWAY_UPSTREAM_MODEL")
+        .or_else(|| preset.map(|value| value.model.to_owned()));
+    let upstream_configured = upstream_key.is_some()
+        || env_nonempty("AI_GATEWAY_UPSTREAM_PROVIDER").is_some()
+        || upstream_model.is_some()
+        || env_nonempty("AI_GATEWAY_UPSTREAM_BASE_URL").is_some()
+        || env_nonempty("AI_GATEWAY_UPSTREAM_NAME").is_some();
     if upstream_configured {
         let kind = upstream_kind;
         if !matches!(
@@ -2644,12 +2726,15 @@ fn env_config() -> Result<Config> {
             ));
         }
         let base_url = env_nonempty("AI_GATEWAY_UPSTREAM_BASE_URL")
+            .or_else(|| preset.map(|value| value.base_url.to_owned()))
             .unwrap_or_else(|| default_upstream_base_url(&kind).to_owned())
             .trim_end_matches('/')
             .to_owned();
         let model = upstream_model.unwrap_or_else(|| default_upstream_model(&kind).to_owned());
         providers.push(ProviderConfig {
-            name: env_nonempty("AI_GATEWAY_UPSTREAM_NAME").unwrap_or_else(|| "upstream".to_owned()),
+            name: env_nonempty("AI_GATEWAY_UPSTREAM_NAME")
+                .or_else(|| preset.map(|value| value.name.to_owned()))
+                .unwrap_or_else(|| "upstream".to_owned()),
             kind,
             base_url,
             model,
@@ -2895,20 +2980,100 @@ fn default_upstream_model(kind: &str) -> &'static str {
     }
 }
 
-fn init_dotenv(path: &FsPath) -> Result<()> {
+fn option_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find(|window| window[0] == name)
+        .map(|window| window[1].as_str())
+}
+
+fn init_dotenv(path: &FsPath, provider_name: &str) -> Result<()> {
     if path.exists() {
         return Err(anyhow!(
             "{} already exists; edit it instead of overwriting it",
             path.display()
         ));
     }
-    fs::write(path, include_str!("../.env.example"))
-        .with_context(|| format!("failed to create {}", path.display()))?;
+    let preset = provider_preset(provider_name).ok_or_else(|| {
+        anyhow!(
+            "unknown provider preset '{provider_name}'; choose openai, openrouter, deepseek, siliconflow, anthropic, gemini, or ollama"
+        )
+    })?;
+    let api_key = format!("ag_{}", uuid::Uuid::new_v4().simple());
+    let admin_key = format!("adm_{}", uuid::Uuid::new_v4().simple());
+    let contents = format!(
+        "# Generated by `ai-gateway init --provider {provider_name}`.\n# Put your upstream token on the next line. Leave it empty for Ollama.\nAI_GATEWAY_UPSTREAM_PROVIDER={}\nAI_GATEWAY_UPSTREAM_API_KEY=\n# Optional overrides: AI_GATEWAY_UPSTREAM_MODEL=...\n\n# Local access keys. Keep this file private.\nAI_GATEWAY_API_KEY={api_key}\nAI_GATEWAY_ADMIN_API_KEY={admin_key}\n",
+        preset.name
+    );
+    fs::write(path, contents).with_context(|| format!("failed to create {}", path.display()))?;
     println!(
-        "Created {}. Put your upstream key in it, then run `ai-gateway check-config`.",
-        path.display()
+        "Created {} for {}.\n\nNext:\n  1. Put your upstream key in .env (skip this for Ollama).\n  2. Run `ai-gateway doctor`.\n  3. Run `ai-gateway` and send requests to http://127.0.0.1:8080/v1.\n\nThe generated app and admin keys are saved in .env; do not commit that file.",
+        path.display(), preset.name
     );
     Ok(())
+}
+
+fn print_doctor(config: &Config) {
+    let authenticated = config
+        .providers
+        .iter()
+        .filter(|provider| provider.api_key.is_some())
+        .count();
+    println!("AI Gateway {VERSION} configuration\n");
+    println!(
+        "  listen       {}:{}",
+        config.server.host, config.server.port
+    );
+    println!(
+        "  providers    {} configured, {} with credentials",
+        config.providers.len(),
+        authenticated
+    );
+    println!(
+        "  auth         app={} admin={}",
+        yes_no(config.server.api_key.is_some()),
+        yes_no(config.server.admin_api_key.is_some())
+    );
+    println!("  database     {}", config.server.database_path);
+    println!();
+    for provider in &config.providers {
+        let auth = if provider.api_key.is_some() {
+            "credentialed"
+        } else if provider.kind == "ollama" {
+            "local/no key"
+        } else {
+            "missing key"
+        };
+        println!(
+            "  {:<18} {:<17} {:<16} {}",
+            provider.name, provider.kind, provider.model, auth
+        );
+    }
+    println!();
+    if config.server.host != "127.0.0.1" && config.server.api_key.is_none() {
+        println!("warning: the gateway is exposed beyond localhost without an app key");
+    }
+    if config.server.admin_api_key.is_none()
+        && (config.server.api_key.is_none() && !is_loopback_host(&config.server.host))
+    {
+        println!("warning: the dashboard needs AI_GATEWAY_ADMIN_API_KEY (or the app key)");
+    }
+    if authenticated == 0
+        && !config
+            .providers
+            .iter()
+            .any(|provider| provider.kind == "ollama")
+    {
+        println!("warning: no provider credentials found; add an upstream key before starting");
+    }
+    println!("\nconfiguration looks valid; run `ai-gateway` to start");
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "on"
+    } else {
+        "off"
+    }
 }
 
 fn validate_routes(
@@ -3048,6 +3213,36 @@ fn load_dotenv(path: &FsPath) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_presets_cover_common_backends() {
+        let openrouter = provider_preset("OpenRouter").expect("preset");
+        assert_eq!(openrouter.kind, "openai-compatible");
+        assert_eq!(openrouter.base_url, "https://openrouter.ai/api/v1");
+        let ollama = provider_preset("ollama").expect("preset");
+        assert_eq!(ollama.kind, "ollama");
+        assert!(provider_preset("not-a-provider").is_none());
+    }
+
+    #[test]
+    fn loopback_detection_accepts_local_hosts_only() {
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("::1"));
+        assert!(!is_loopback_host("0.0.0.0"));
+    }
+
+    #[test]
+    fn option_value_reads_cli_pairs() {
+        let args = vec![
+            "ai-gateway".to_owned(),
+            "init".to_owned(),
+            "--provider".to_owned(),
+            "deepseek".to_owned(),
+        ];
+        assert_eq!(option_value(&args, "--provider"), Some("deepseek"));
+        assert_eq!(option_value(&args, "--missing"), None);
+    }
 
     fn provider(name: &str, model: &str, priority: i64) -> ProviderConfig {
         ProviderConfig {

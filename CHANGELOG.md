@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.0
+
+- Added provider presets for `init`, including OpenAI, OpenRouter, DeepSeek, SiliconFlow, Anthropic, Gemini, and Ollama.
+- Added generated local application/admin keys during first-run setup.
+- Added the `doctor` command for a readable configuration and credential check.
+- Reworked the README around the first request, SDK integration, and production setup.
+- Docker now generates and persists random app/admin keys when they are not supplied.
+- Documented that managed token limits use a conservative reservation estimate until provider usage is known.
+
 ## 0.8.0
 
 - Added OpenAI-compatible usage chunks to normalized non-OpenAI streams.

@@ -16,6 +16,7 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY --from=builder /src/target/release/ai-gateway /usr/local/bin/ai-gateway
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint
 RUN mkdir -p /data && chown gateway:gateway /data
 
 USER gateway
@@ -27,4 +28,4 @@ EXPOSE 8080
 VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD curl --fail --silent http://127.0.0.1:8080/live || exit 1
 
-ENTRYPOINT ["/usr/local/bin/ai-gateway"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint"]

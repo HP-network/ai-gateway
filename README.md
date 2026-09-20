@@ -1,20 +1,25 @@
 # AI Gateway
 
-<p align="center">
-  <strong>把任何 OpenAI-compatible API 变成一个稳定入口。</strong><br>
-  一个 Rust 二进制，负责路由、故障切换、鉴权、限流和用量统计。
-</p>
+一个可以直接替换 `base_url` 的 AI API 网关。
 
-<p align="center">
+它把 OpenAI、OpenRouter、DeepSeek、SiliconFlow、Anthropic、Gemini 和 Ollama 放到一个入口，提供故障切换、限流、客户端密钥、用量审计和成本统计。运行时是 Rust 单二进制，默认使用 SQLite，不需要 Postgres、Redis 或前端构建工具。
+
+<p>
   <a href="https://github.com/HP-network/ai-gateway/actions/workflows/ci.yml"><img src="https://github.com/HP-network/ai-gateway/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/HP-network/ai-gateway/releases"><img src="https://img.shields.io/github/v/release/HP-network/ai-gateway" alt="Release"></a>
-  <a href="https://github.com/HP-network/ai-gateway/blob/main/LICENSE"><img src="https://img.shields.io/github/license/HP-network/ai-gateway" alt="License"></a>
+  <a href="https://github.com/HP-network/ai-gateway/blob/main/LICENSE"><img src="https://img.shields.io/github/license/HP-network/ai-gateway" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/Rust-1.88%2B-orange" alt="Rust 1.88 or newer">
 </p>
 
+## 先决定它适不适合你
+
+适合：你有一个或多个模型 API，想让应用只认一个稳定地址；需要自动切换、密钥隔离、限流、审计，或者想在本地跑 Ollama。
+
+不适合：你需要订阅额度池、充值支付、OAuth 账号池或完整的 SaaS 用户系统。那类需求应该选择专门的配额分发平台；本项目刻意保持单机、低依赖和容易迁移。
+
 ## 60 秒启动
 
-需要 Docker。先复制项目并创建配置：
+### Docker
 
 ```bash
 git clone https://github.com/HP-network/ai-gateway.git
@@ -22,143 +27,126 @@ cd ai-gateway
 cp .env.example .env
 ```
 
-打开 `.env`，只填这三项就够了：
+编辑 `.env`，最少填 provider 和上游 key。下面以 OpenRouter 为例，换成 OpenAI、DeepSeek 或 SiliconFlow 时只改这两行：
 
 ```dotenv
-AI_GATEWAY_UPSTREAM_API_KEY=sk-...
-AI_GATEWAY_UPSTREAM_BASE_URL=https://api.openai.com/v1
-AI_GATEWAY_UPSTREAM_MODEL=gpt-4o-mini
+AI_GATEWAY_UPSTREAM_PROVIDER=openrouter
+AI_GATEWAY_UPSTREAM_API_KEY=sk-or-v1-...
 ```
 
-启动并检查：
+程序会自动选择对应 Base URL 和默认模型。需要自定义模型时再加 `AI_GATEWAY_UPSTREAM_MODEL`；自定义 OpenAI-compatible 服务时可以省略 provider，直接填写 `AI_GATEWAY_UPSTREAM_BASE_URL`、`AI_GATEWAY_UPSTREAM_MODEL` 和 key。
+
+复制 `.env.example` 的 Docker 演示默认不会把固定 key 写进仓库。容器第一次启动时会在持久化 volume 中生成随机的 app/admin key：
 
 ```bash
 docker compose up -d --build
-curl http://127.0.0.1:8080/health
+docker compose exec -T ai-gateway cat /data/generated-keys.env > .docker-keys.env
+chmod 600 .docker-keys.env
+set -a; source .docker-keys.env; set +a
+curl http://127.0.0.1:8080/live
 ```
 
-发出第一条请求：
+记下 admin key，启动后用它打开 dashboard；客户端使用 app key。你也可以在 `.env` 中显式设置两把 key，入口脚本会保留你的值。
+
+调用：
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"auto","messages":[{"role":"user","content":"你好"}]}'
+  -H "Authorization: Bearer $AI_GATEWAY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"用一句话介绍你自己"}]}'
 ```
 
-客户端只需要把 `base_url` 改成 `http://127.0.0.1:8080/v1`。原来的 OpenAI SDK、LangChain 或 LiteLLM 客户端不用改请求格式。
+### 本地二进制
 
-### 常用上游
-
-| 服务 | `AI_GATEWAY_UPSTREAM_BASE_URL` | 示例模型 |
-| --- | --- | --- |
-| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
-| OpenRouter | `https://openrouter.ai/api/v1` | `openai/gpt-4o-mini` |
-| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` |
-| SiliconFlow | `https://api.siliconflow.cn/v1` | `deepseek-ai/DeepSeek-V3` |
-| 本地 Ollama | `http://host.docker.internal:11434` | `llama3.2` |
-
-把上表中的地址和模型放进 `.env`，不需要写 JSON。
-
-## 不用 Docker
-
-安装 Rust 1.88 或更新版本：
+需要 Rust 1.88 或更新版本：
 
 ```bash
 git clone https://github.com/HP-network/ai-gateway.git
 cd ai-gateway
-cargo run --release -- init
-# 编辑 .env，填入上游 key
-cargo run --release -- check-config
+cargo run --release -- init --provider openrouter
+```
+
+`init` 会生成 `.env`、随机的应用 key 和管理 key。把上游 token 填进去，然后：
+
+```bash
+cargo run --release -- doctor
 cargo run --release
 ```
 
-`init` 不会覆盖已有的 `.env`。也可以直接安装二进制：
+可用的预设：`openai`、`openrouter`、`deepseek`、`siliconflow`、`anthropic`、`gemini`、`ollama`。已有 `.env` 时 `init` 不会覆盖它。
 
-```bash
-cargo install --path .
-ai-gateway check-config
-ai-gateway
-```
+## 接入任何 OpenAI SDK
 
-## 接入 SDK
+只改 `base_url`，请求格式不变：
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(
     base_url="http://127.0.0.1:8080/v1",
-    api_key="unused",  # 设置 AI_GATEWAY_API_KEY 后改成对应值
+    api_key="your-ai-gateway-key",
 )
 
-answer = client.chat.completions.create(
+result = client.chat.completions.create(
     model="auto",
-    messages=[{"role": "user", "content": "给我一个实用的插件点子"}],
+    messages=[{"role": "user", "content": "给我一个可执行的产品点子"}],
 )
-print(answer.choices[0].message.content)
+print(result.choices[0].message.content)
 ```
 
-流式请求保持 OpenAI SSE 格式：
+流式响应也是标准 OpenAI SSE：
 
 ```bash
 curl --no-buffer http://127.0.0.1:8080/v1/chat/completions \
-  -H 'content-type: application/json' \
+  -H "Authorization: Bearer ${AI_GATEWAY_API_KEY}" \
+  -H "Content-Type: application/json" \
   -d '{"model":"auto","stream":true,"messages":[{"role":"user","content":"说三句短句"}]}'
 ```
 
-## 生产配置
+## 上游预设
 
-默认只监听 `127.0.0.1`。如果要让其他机器访问，至少设置应用和管理密钥：
+| 服务 | Base URL | 示例模型 |
+| --- | --- | --- |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
+| OpenRouter | `https://openrouter.ai/api/v1` | `openai/gpt-4o-mini` |
+| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` |
+| SiliconFlow | `https://api.siliconflow.cn/v1` | `deepseek-ai/DeepSeek-V3` |
+| Anthropic | `https://api.anthropic.com` | `claude-3-5-haiku-latest` |
+| Gemini | `https://generativelanguage.googleapis.com` | `gemini-2.0-flash` |
+| Ollama | `http://127.0.0.1:11434` | `llama3.2` |
 
-```dotenv
-AI_GATEWAY_HOST=0.0.0.0
-AI_GATEWAY_API_KEY=app-secret
-AI_GATEWAY_ADMIN_API_KEY=admin-secret
-AI_GATEWAY_RATE_LIMIT=120
-```
+OpenAI-compatible 服务只需要设置 provider 和 key；多个 provider、模型别名和 task route 再使用 `config.json`，不要为了单个上游一开始就写 JSON。
 
-然后客户端带上：
+## 管理面板
+
+启动后打开 <http://127.0.0.1:8080/dashboard>，输入 `AI_GATEWAY_ADMIN_API_KEY`。面板提供：
+
+- 总请求、成功率、tokens、平均延迟和估算成本
+- provider 状态、并发槽位和错误次数
+- 最近请求审计、provider/model 分解
+- 创建和撤销客户端 API key，并设置请求/token 配额
+
+管理 API 示例：
 
 ```bash
-curl http://127.0.0.1:8080/v1/models \
-  -H 'authorization: Bearer app-secret'
-```
-
-管理面板在 `/dashboard`，管理 API 需要 `AI_GATEWAY_ADMIN_API_KEY`：
-
-```bash
+export ADMIN_KEY=your-admin-key
 curl http://127.0.0.1:8080/admin/stats \
-  -H 'authorization: Bearer admin-secret'
-```
+  -H "Authorization: Bearer $ADMIN_KEY"
 
-创建一个可撤销的客户端 key：
-
-```bash
 curl -X POST http://127.0.0.1:8080/admin/api-keys \
-  -H 'authorization: Bearer admin-secret' \
-  -H 'content-type: application/json' \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
   -d '{"name":"my-app","request_limit":10000,"token_limit":5000000}'
 ```
 
-返回的 `ag_...` token 只展示一次。SQLite 数据默认保存到 `ai-gateway.db`，Docker Compose 会放在持久化 volume 中。
-请求审计默认保留 30 天，可通过 `AI_GATEWAY_AUDIT_RETENTION_DAYS` 调整；设为 `0` 时不自动清理。
+创建 key 的 token 只在创建响应中显示一次。数据库默认是 `ai-gateway.db`；Compose 会把它放在持久化 volume 中。审计记录默认保留 30 天，可用 `AI_GATEWAY_AUDIT_RETENTION_DAYS=0` 关闭自动清理。
 
-## 能力
+`token_limit` 会在请求开始时按消息 JSON 大小加 `max_tokens` 做预留，用来防止并发请求穿透配额；上游返回的真实 usage 会在请求结束后结算。它不是 tokenizer 精确计费，生产计费请以 provider 的 usage 为准。
 
-- 一个 OpenAI-compatible `/v1/chat/completions` 入口
-- OpenAI-compatible、Anthropic、Gemini、Ollama 适配器
-- 非流式和 SSE streaming，统一返回 OpenAI 格式
-- provider 优先级、模型别名、task route 和失败切换
-- provider 并发控制、超时和 cooldown
-- 可选主密钥、管理密钥、哈希客户端 key 和撤销
-- 每个身份的滑动窗口限流、请求/Token 配额
-- 原子 token 预算预留，避免并发请求穿透配额
-- 请求级审计、`X-Request-ID`、provider 成本和错误追踪
-- SQLite 用量统计、Prometheus `/metrics` 和 `/dashboard`
-- 多阶段 Docker 构建，运行时使用非 root 用户
+## 多 provider 路由
 
-## 多 Provider 与高级路由
-
-只有需要多个供应商、不同优先级或 task route 时才使用 `config.json`：
+复制 `config.example.json` 后再启动：
 
 ```bash
 cp config.example.json config.json
@@ -166,48 +154,53 @@ ai-gateway check-config --config config.json
 ai-gateway --config config.json
 ```
 
-JSON 中的密钥建议使用 `api_key_env`，不要把真实 token 提交到仓库。`routing.model_aliases` 可以把客户端稳定名称映射到真实模型，例如 `fast` 或 `local`。
+可以配置 provider 优先级、失败冷却、最大并发、模型别名和 task route：
 
-每个 provider 还可以设置 `input_price_per_million` 和 `output_price_per_million`。环境模式对应：
-
-```dotenv
-AI_GATEWAY_UPSTREAM_INPUT_PRICE=0.15
-AI_GATEWAY_UPSTREAM_OUTPUT_PRICE=0.60
+```json
+{
+  "routing": {
+    "default_model": "auto",
+    "max_retries": 2,
+    "model_aliases": {"fast": "gpt-4o-mini"},
+    "task_routes": {"code": ["deepseek", "openai"]}
+  }
+}
 ```
 
-价格单位是每百万 token 的美元成本，未设置时成本显示为零。
+密钥使用 `api_key_env` 从环境变量读取，不要把真实 token 写进仓库。价格字段是每百万 token 的美元价格，用于估算成本，不会向上游重新计费。
 
-## API
+## API 速查
 
-| 方法 | 地址 | 作用 |
+| 方法 | 地址 | 用途 |
 | --- | --- | --- |
-| `POST` | `/v1/chat/completions` | OpenAI-compatible 对话和流式输出 |
+| `POST` | `/v1/chat/completions` | 对话和 SSE streaming |
 | `GET` | `/v1/models` | 已配置模型 |
-| `GET` | `/health` | provider 状态和并发槽位 |
 | `GET` | `/live` | 无鉴权存活探针 |
 | `GET` | `/ready` | provider 就绪探针 |
+| `GET` | `/health` | provider 健康状态 |
 | `GET` | `/metrics` | Prometheus 指标 |
-| `GET` | `/dashboard` | 浏览器运营面板 |
+| `GET` | `/dashboard` | 浏览器管理面板 |
 | `GET` | `/admin/stats` | 聚合用量 |
-| `GET` | `/admin/requests?limit=50` | 最近请求、状态、延迟和错误 |
-| `GET` | `/admin/breakdown` | provider/model 用量与成本分解 |
-| `GET/POST` | `/admin/api-keys` | 管理客户端 key |
-| `DELETE` | `/admin/api-keys/:id` | 撤销客户端 key |
+| `GET` | `/admin/requests?limit=50` | 最近请求 |
+| `GET` | `/admin/breakdown` | provider/model 统计 |
+| `GET/POST` | `/admin/api-keys` | 客户端 key |
+| `DELETE` | `/admin/api-keys/:id` | 撤销 key |
 
-## 配置检查与故障排查
-
-先运行：
+## 配置排查
 
 ```bash
+ai-gateway doctor
 ai-gateway check-config
 ```
 
-它会输出监听地址、鉴权状态和已发现的 provider，不会启动端口。常见问题：
+`doctor` 用人话显示监听地址、鉴权、provider、模型和凭据状态。常见问题：
 
-- `no provider`：检查 `AI_GATEWAY_UPSTREAM_API_KEY`，或确认 `OPENAI_API_KEY` / `OLLAMA_MODEL` 已设置。
-- `401`：设置了 `AI_GATEWAY_API_KEY` 后，请求必须带 `Authorization: Bearer ...`。
-- Docker 访问宿主机 Ollama：使用 `http://host.docker.internal:11434`，Compose 已配置映射。
-- 上游超时：调整 `AI_GATEWAY_TIMEOUT`，并检查 provider 的 base URL 是否包含正确的 `/v1`。
+- `no provider credentials`：给上游填写 `AI_GATEWAY_UPSTREAM_API_KEY`，或使用 Ollama。
+- `401`：客户端 key 和管理 key 是两套值，分别使用 `AI_GATEWAY_API_KEY` 与 `AI_GATEWAY_ADMIN_API_KEY`。
+- Docker 访问宿主机 Ollama：使用 `http://host.docker.internal:11434`。
+- 上游超时：检查 Base URL 是否包含正确的 `/v1`，再调整 `AI_GATEWAY_TIMEOUT`。
+
+生产环境暴露到局域网或公网时，务必设置应用 key 和管理 key，并在反向代理层启用 TLS。不要把 `.env`、数据库或真实 provider token 提交到 Git。
 
 ## 开发
 
