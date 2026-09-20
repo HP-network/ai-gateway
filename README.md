@@ -140,6 +140,7 @@ curl -X POST http://127.0.0.1:8080/admin/api-keys \
 ```
 
 返回的 `ag_...` token 只展示一次。SQLite 数据默认保存到 `ai-gateway.db`，Docker Compose 会放在持久化 volume 中。
+请求审计默认保留 30 天，可通过 `AI_GATEWAY_AUDIT_RETENTION_DAYS` 调整；设为 `0` 时不自动清理。
 
 ## 能力
 
@@ -150,6 +151,8 @@ curl -X POST http://127.0.0.1:8080/admin/api-keys \
 - provider 并发控制、超时和 cooldown
 - 可选主密钥、管理密钥、哈希客户端 key 和撤销
 - 每个身份的滑动窗口限流、请求/Token 配额
+- 原子 token 预算预留，避免并发请求穿透配额
+- 请求级审计、`X-Request-ID`、provider 成本和错误追踪
 - SQLite 用量统计、Prometheus `/metrics` 和 `/dashboard`
 - 多阶段 Docker 构建，运行时使用非 root 用户
 
@@ -165,6 +168,15 @@ ai-gateway --config config.json
 
 JSON 中的密钥建议使用 `api_key_env`，不要把真实 token 提交到仓库。`routing.model_aliases` 可以把客户端稳定名称映射到真实模型，例如 `fast` 或 `local`。
 
+每个 provider 还可以设置 `input_price_per_million` 和 `output_price_per_million`。环境模式对应：
+
+```dotenv
+AI_GATEWAY_UPSTREAM_INPUT_PRICE=0.15
+AI_GATEWAY_UPSTREAM_OUTPUT_PRICE=0.60
+```
+
+价格单位是每百万 token 的美元成本，未设置时成本显示为零。
+
 ## API
 
 | 方法 | 地址 | 作用 |
@@ -175,6 +187,8 @@ JSON 中的密钥建议使用 `api_key_env`，不要把真实 token 提交到仓
 | `GET` | `/metrics` | Prometheus 指标 |
 | `GET` | `/dashboard` | 浏览器运营面板 |
 | `GET` | `/admin/stats` | 聚合用量 |
+| `GET` | `/admin/requests?limit=50` | 最近请求、状态、延迟和错误 |
+| `GET` | `/admin/breakdown` | provider/model 用量与成本分解 |
 | `GET/POST` | `/admin/api-keys` | 管理客户端 key |
 | `DELETE` | `/admin/api-keys/:id` | 撤销客户端 key |
 

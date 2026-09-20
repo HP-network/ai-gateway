@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0
+
+- Added durable per-request audit records with request IDs, provider, model, status, latency, token usage, error details, and estimated cost.
+- Added `X-Request-ID` propagation and new `/admin/requests` and `/admin/breakdown` endpoints.
+- Added provider input/output token prices and cost aggregation in the operations console.
+- Streaming usage is now collected through completion, with upstream failures and client disconnects recorded separately.
+- Managed-key token budgets now reserve request capacity atomically to prevent concurrent quota overshoot.
+- Expanded the dashboard with provider breakdowns and a recent-request view.
+
 ## 0.6.0
 
 - Added a one-provider environment setup for OpenAI-compatible services such as OpenAI, OpenRouter, DeepSeek, and SiliconFlow.
@@ -10,7 +19,7 @@
 
 ## 0.5.0
 
-- Added atomic per-key request and token quota reservations with SQLite-compatible migration for existing databases.
+- Added per-key request quotas and token usage limits with SQLite-compatible migration for existing databases.
 - Added optional request and token limits to managed key creation and the operations dashboard.
 - Added per-provider concurrency gates and live available-slot health reporting.
 - Added model aliases with startup validation so clients can use stable names while providers change.

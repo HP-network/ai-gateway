@@ -2,8 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use async_stream::try_stream;
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Path, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{DefaultBodyLimit, Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -31,7 +31,7 @@ use tokio::{
 use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
 use tracing::{error, info};
 
-const VERSION: &str = "0.6.0";
+const VERSION: &str = "0.7.0";
 const MAX_BODY_BYTES: usize = 2_000_000;
 
 #[derive(Clone)]
@@ -60,6 +60,7 @@ struct ServerConfig {
     database_path: String,
     rate_limit_per_minute: usize,
     request_timeout_seconds: f64,
+    audit_retention_days: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -81,7 +82,17 @@ struct ProviderConfig {
     timeout_seconds: f64,
     priority: i64,
     max_concurrency: usize,
+    input_price_per_million: f64,
+    output_price_per_million: f64,
     headers: HashMap<String, String>,
+}
+
+impl ProviderConfig {
+    fn estimated_cost(&self, usage: &Usage) -> f64 {
+        (usage.prompt_tokens as f64 * self.input_price_per_million
+            + usage.completion_tokens as f64 * self.output_price_per_million)
+            / 1_000_000.0
+    }
 }
 
 #[derive(Default)]
@@ -225,7 +236,11 @@ impl RouterState {
         }
     }
 
-    async fn route(&self, client: &Client, request: &ChatRequest) -> Result<ChatResponse> {
+    async fn route(
+        &self,
+        client: &Client,
+        request: &ChatRequest,
+    ) -> Result<(ProviderConfig, ChatResponse)> {
         let candidates = self.candidates(request);
         if candidates.is_empty() {
             return Err(anyhow!("no healthy provider matches this request"));
@@ -260,7 +275,7 @@ impl RouterState {
                     runtime.failures = 0;
                     runtime.unavailable_until = None;
                     runtime.latency_total += started.elapsed();
-                    return Ok(response);
+                    return Ok((provider, response));
                 }
                 Err(error) => {
                     let elapsed = started.elapsed();
@@ -581,6 +596,15 @@ struct Usage {
 }
 
 impl Usage {
+    fn merge(&mut self, other: Self) {
+        self.prompt_tokens = self.prompt_tokens.max(other.prompt_tokens);
+        self.completion_tokens = self.completion_tokens.max(other.completion_tokens);
+        self.total_tokens = self
+            .total_tokens
+            .max(other.total_tokens)
+            .max(self.prompt_tokens.saturating_add(self.completion_tokens));
+    }
+
     fn from_value(value: Option<&Value>) -> Self {
         let object = value.and_then(Value::as_object);
         let get = |keys: &[&str]| {
@@ -592,9 +616,18 @@ impl Usage {
                 })
                 .unwrap_or(0)
         };
-        let prompt_tokens = get(&["prompt_tokens", "input_tokens", "promptTokenCount"]);
-        let completion_tokens =
-            get(&["completion_tokens", "output_tokens", "candidatesTokenCount"]);
+        let prompt_tokens = get(&[
+            "prompt_tokens",
+            "input_tokens",
+            "promptTokenCount",
+            "prompt_eval_count",
+        ]);
+        let completion_tokens = get(&[
+            "completion_tokens",
+            "output_tokens",
+            "candidatesTokenCount",
+            "eval_count",
+        ]);
         let total_tokens =
             get(&["total_tokens", "totalTokenCount"]).max(prompt_tokens + completion_tokens);
         Self {
@@ -799,27 +832,138 @@ fn provider_request(
 
 type ByteStream = Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, io::Error>> + Send>>;
 
+struct StreamAudit {
+    state: AppState,
+    provider: ProviderConfig,
+    record: RequestRecord,
+    started: Instant,
+    terminal: bool,
+}
+
+impl StreamAudit {
+    fn complete(&mut self, usage: Usage) {
+        self.record.status = StatusCode::OK.as_u16();
+        self.record.usage = usage;
+        self.terminal = true;
+    }
+
+    fn fail(&mut self, error: &str) {
+        self.record.status = StatusCode::BAD_GATEWAY.as_u16();
+        self.record.error = Some(truncate(error, 500));
+        self.terminal = true;
+    }
+}
+
+impl Drop for StreamAudit {
+    fn drop(&mut self) {
+        if !self.terminal {
+            self.record.status = 499;
+            self.record.error = Some("stream disconnected before completion".to_owned());
+        }
+        let elapsed = self.started.elapsed();
+        self.record.latency_ms = elapsed.as_secs_f64() * 1000.0;
+        self.record.estimated_cost = self.provider.estimated_cost(&self.record.usage);
+        let success = self.record.status < 400;
+        if let Ok(mut metrics) = self.state.metrics.lock() {
+            metrics.record(success, elapsed);
+        }
+        match self.state.store.lock() {
+            Ok(mut store) => {
+                if let Err(error) = store.record(&self.record) {
+                    error!(%error, request_id = %self.record.request_id, "failed to persist stream audit");
+                }
+            }
+            Err(error) => {
+                error!(%error, request_id = %self.record.request_id, "request store is unavailable");
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct SseUsageCollector {
+    buffer: String,
+    usage: Usage,
+}
+
+impl SseUsageCollector {
+    fn push(&mut self, chunk: &[u8]) {
+        self.buffer.push_str(&String::from_utf8_lossy(chunk));
+        while let Some(position) = self.buffer.find('\n') {
+            let line = self.buffer[..position].trim_end_matches('\r').to_owned();
+            self.buffer.drain(..=position);
+            self.process(&line);
+        }
+    }
+
+    fn finish(mut self) -> Usage {
+        if !self.buffer.trim().is_empty() {
+            let line = self.buffer.trim().to_owned();
+            self.process(&line);
+        }
+        self.usage
+    }
+
+    fn process(&mut self, line: &str) {
+        let data = line
+            .trim()
+            .strip_prefix("data:")
+            .map(str::trim)
+            .unwrap_or_default();
+        if data.is_empty() || data == "[DONE]" {
+            return;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(data) {
+            self.usage.merge(Usage::from_value(value.get("usage")));
+        }
+    }
+}
+
 fn provider_stream_body(
     response: reqwest::Response,
     provider: &ProviderConfig,
     model: String,
     permit: OwnedSemaphorePermit,
+    audit: StreamAudit,
 ) -> ByteStream {
     if matches!(provider.kind.as_str(), "openai" | "openai-compatible") {
-        return Box::pin(response.bytes_stream().map(move |chunk| {
-            let _permit = &permit;
-            chunk.map_err(|error| io::Error::other(error.to_string()))
-        }));
+        let stream = try_stream! {
+            let _permit = permit;
+            let mut audit = audit;
+            let mut collector = SseUsageCollector::default();
+            let mut source = response.bytes_stream();
+            while let Some(chunk) = source.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        collector.push(&chunk);
+                        yield chunk;
+                    }
+                    Err(error) => {
+                        audit.fail(&error.to_string());
+                        Err(io::Error::other(error.to_string()))?;
+                    }
+                }
+            }
+            audit.complete(collector.finish());
+        };
+        return Box::pin(stream);
     }
     let kind = provider.kind.clone();
     let stream = try_stream! {
         let _permit = permit;
+        let mut audit = audit;
         let mut source = response.bytes_stream();
         let mut buffer = String::new();
         let mut normalizer = StreamNormalizer::new(kind, model);
         yield normalizer.initial();
         while let Some(chunk) = source.next().await {
-            let chunk = chunk.map_err(|error| io::Error::other(error.to_string()))?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    audit.fail(&error.to_string());
+                    Err(io::Error::other(error.to_string()))?
+                }
+            };
             buffer.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(position) = buffer.find('\n') {
                 let line = buffer[..position].trim_end_matches('\r').to_owned();
@@ -837,6 +981,7 @@ fn provider_stream_body(
         for frame in normalizer.finish() {
             yield frame;
         }
+        audit.complete(normalizer.usage());
     };
     Box::pin(stream)
 }
@@ -847,6 +992,7 @@ struct StreamNormalizer {
     created: i64,
     model: String,
     finished: bool,
+    usage: Usage,
 }
 
 impl StreamNormalizer {
@@ -857,6 +1003,7 @@ impl StreamNormalizer {
             created: unix_now(),
             model,
             finished: false,
+            usage: Usage::default(),
         }
     }
 
@@ -884,6 +1031,17 @@ impl StreamNormalizer {
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return Vec::new();
         };
+        self.usage.merge(Usage::from_value(Some(
+            value
+                .get("usage")
+                .or_else(|| value.get("usageMetadata"))
+                .or_else(|| {
+                    value
+                        .get("message")
+                        .and_then(|message| message.get("usage"))
+                })
+                .unwrap_or(&value),
+        )));
         match self.kind.as_str() {
             "anthropic" => self.anthropic(value),
             "gemini" => self.gemini(value),
@@ -995,6 +1153,10 @@ impl StreamNormalizer {
 
     fn finish(&mut self) -> Vec<Bytes> {
         self.finish_with("stop")
+    }
+
+    fn usage(&self) -> Usage {
+        self.usage.clone()
     }
 }
 
@@ -1141,12 +1303,28 @@ struct ApiKey {
     token_limit: Option<i64>,
 }
 
+#[derive(Clone)]
+struct RequestRecord {
+    request_id: String,
+    key_id: Option<i64>,
+    provider: String,
+    model: String,
+    stream: bool,
+    status: u16,
+    latency_ms: f64,
+    usage: Usage,
+    estimated_cost: f64,
+    reserved_tokens: u64,
+    error: Option<String>,
+}
+
 struct Store {
     connection: Connection,
+    audit_retention_days: u64,
 }
 
 impl Store {
-    fn open(path: &str) -> Result<Self> {
+    fn open_with_retention(path: &str, audit_retention_days: u64) -> Result<Self> {
         let path = if path == ":memory:" {
             PathBuf::from(path)
         } else {
@@ -1182,6 +1360,26 @@ impl Store {
                 total_tokens INTEGER NOT NULL DEFAULT 0,
                 latency_seconds REAL NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                key_id INTEGER,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                stream INTEGER NOT NULL,
+                status INTEGER NOT NULL,
+                latency_ms REAL NOT NULL,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                estimated_cost REAL NOT NULL DEFAULT 0,
+                error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS requests_created_at_idx
+                ON requests(created_at DESC);
+            CREATE INDEX IF NOT EXISTS requests_provider_idx
+                ON requests(provider, created_at DESC);
             INSERT OR IGNORE INTO usage (id) VALUES (1);",
         )?;
         for column in ["request_limit", "token_limit"] {
@@ -1197,7 +1395,21 @@ impl Store {
                 )?;
             }
         }
-        Ok(Self { connection })
+        let has_reserved_tokens: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('api_keys') WHERE name='reserved_tokens'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_reserved_tokens == 0 {
+            connection.execute(
+                "ALTER TABLE api_keys ADD COLUMN reserved_tokens INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        Ok(Self {
+            connection,
+            audit_retention_days,
+        })
     }
 
     fn has_keys(&self) -> Result<bool> {
@@ -1263,13 +1475,19 @@ impl Store {
             .optional()?)
     }
 
-    fn reserve(&mut self, id: i64) -> Result<bool> {
+    fn reserve(&mut self, id: i64, requested_tokens: u64) -> Result<bool> {
         Ok(self.connection.execute(
-            "UPDATE api_keys SET last_used_at = ?, requests = requests + 1
+            "UPDATE api_keys SET last_used_at = ?, requests = requests + 1,
+                                 reserved_tokens = reserved_tokens + ?
              WHERE id = ? AND revoked_at IS NULL
                AND (request_limit IS NULL OR requests < request_limit)
-               AND (token_limit IS NULL OR tokens < token_limit)",
-            params![unix_now(), id],
+               AND (token_limit IS NULL OR tokens + reserved_tokens + ? <= token_limit)",
+            params![
+                unix_now(),
+                requested_tokens as i64,
+                id,
+                requested_tokens as i64
+            ],
         )? == 1)
     }
 
@@ -1292,14 +1510,9 @@ impl Store {
         Ok(keys)
     }
 
-    fn record(
-        &mut self,
-        success: bool,
-        usage: &Usage,
-        elapsed: Duration,
-        key_id: Option<i64>,
-    ) -> Result<()> {
-        self.connection.execute(
+    fn record(&mut self, record: &RequestRecord) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
             "UPDATE usage SET requests=requests+1,
              successful_requests=successful_requests+?,
              failed_requests=failed_requests+?,
@@ -1308,21 +1521,110 @@ impl Store {
              total_tokens=total_tokens+?,
              latency_seconds=latency_seconds+? WHERE id=1",
             params![
-                success as i64,
-                (!success) as i64,
-                usage.prompt_tokens as i64,
-                usage.completion_tokens as i64,
-                usage.total_tokens as i64,
-                elapsed.as_secs_f64()
+                (record.status < 400) as i64,
+                (record.status >= 400) as i64,
+                record.usage.prompt_tokens as i64,
+                record.usage.completion_tokens as i64,
+                record.usage.total_tokens as i64,
+                record.latency_ms / 1000.0
             ],
         )?;
-        if let Some(key_id) = key_id {
-            self.connection.execute(
-                "UPDATE api_keys SET tokens=tokens+? WHERE id=?",
-                params![usage.total_tokens as i64, key_id],
+        if let Some(key_id) = record.key_id {
+            transaction.execute(
+                "UPDATE api_keys SET tokens=tokens+?,
+                                     reserved_tokens=MAX(reserved_tokens-?,0)
+                 WHERE id=?",
+                params![
+                    record.usage.total_tokens as i64,
+                    record.reserved_tokens as i64,
+                    key_id
+                ],
             )?;
         }
+        transaction.execute(
+            "INSERT INTO requests
+             (request_id,created_at,key_id,provider,model,stream,status,latency_ms,
+              prompt_tokens,completion_tokens,total_tokens,estimated_cost,error)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![
+                record.request_id,
+                unix_now(),
+                record.key_id,
+                record.provider,
+                record.model,
+                record.stream as i64,
+                record.status as i64,
+                record.latency_ms,
+                record.usage.prompt_tokens as i64,
+                record.usage.completion_tokens as i64,
+                record.usage.total_tokens as i64,
+                record.estimated_cost,
+                record.error.as_deref()
+            ],
+        )?;
+        if self.audit_retention_days > 0 {
+            let cutoff = unix_now().saturating_sub(
+                self.audit_retention_days
+                    .saturating_mul(86_400)
+                    .min(i64::MAX as u64) as i64,
+            );
+            transaction.execute("DELETE FROM requests WHERE created_at < ?", [cutoff])?;
+        }
+        transaction.commit()?;
         Ok(())
+    }
+
+    fn requests(&self, limit: usize) -> Result<Vec<Value>> {
+        let limit = limit.clamp(1, 200) as i64;
+        let mut statement = self.connection.prepare(
+            "SELECT r.request_id,r.created_at,r.key_id,k.name,r.provider,r.model,r.stream,
+                    r.status,r.latency_ms,r.prompt_tokens,r.completion_tokens,r.total_tokens,
+                    r.estimated_cost,r.error
+             FROM requests r LEFT JOIN api_keys k ON k.id=r.key_id
+             ORDER BY r.id DESC LIMIT ?",
+        )?;
+        let rows = statement.query_map([limit], |row| {
+            Ok(json!({
+                "request_id": row.get::<_, String>(0)?,
+                "created_at": row.get::<_, i64>(1)?,
+                "key_id": row.get::<_, Option<i64>>(2)?,
+                "key_name": row.get::<_, Option<String>>(3)?,
+                "provider": row.get::<_, String>(4)?,
+                "model": row.get::<_, String>(5)?,
+                "stream": row.get::<_, i64>(6)? != 0,
+                "status": row.get::<_, i64>(7)?,
+                "latency_ms": row.get::<_, f64>(8)?,
+                "prompt_tokens": row.get::<_, i64>(9)?,
+                "completion_tokens": row.get::<_, i64>(10)?,
+                "total_tokens": row.get::<_, i64>(11)?,
+                "estimated_cost": row.get::<_, f64>(12)?,
+                "error": row.get::<_, Option<String>>(13)?
+            }))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn breakdown(&self) -> Result<Value> {
+        let mut statement = self.connection.prepare(
+            "SELECT provider,model,COUNT(*),SUM(CASE WHEN status<400 THEN 1 ELSE 0 END),
+                    COALESCE(SUM(total_tokens),0),COALESCE(SUM(estimated_cost),0),
+                    COALESCE(AVG(latency_ms),0)
+             FROM requests GROUP BY provider,model ORDER BY COUNT(*) DESC",
+        )?;
+        let providers = statement
+            .query_map([], |row| {
+                Ok(json!({
+                    "provider": row.get::<_, String>(0)?,
+                    "model": row.get::<_, String>(1)?,
+                    "requests": row.get::<_, i64>(2)?,
+                    "successful_requests": row.get::<_, i64>(3)?,
+                    "total_tokens": row.get::<_, i64>(4)?,
+                    "estimated_cost": row.get::<_, f64>(5)?,
+                    "average_latency_ms": row.get::<_, f64>(6)?
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(json!({"providers": providers}))
     }
 
     fn stats(&self) -> Result<Value> {
@@ -1347,6 +1649,11 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
+        let estimated_cost: f64 = self.connection.query_row(
+            "SELECT COALESCE(SUM(estimated_cost),0) FROM requests",
+            [],
+            |row| row.get(0),
+        )?;
         let average = if row.0 == 0 {
             0.0
         } else {
@@ -1359,6 +1666,7 @@ impl Store {
             "prompt_tokens": row.3,
             "completion_tokens": row.4,
             "total_tokens": row.5,
+            "estimated_cost": estimated_cost,
             "active_keys": active,
             "average_latency_ms": (average * 100.0).round() / 100.0
         }))
@@ -1505,6 +1813,60 @@ fn error_response(status: StatusCode, message: impl Into<String>, error_type: &s
         .into_response()
 }
 
+fn request_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("req_{}", uuid::Uuid::new_v4().simple()))
+}
+
+fn with_request_id(mut response: Response, request_id: &str) -> Response {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
+fn truncate(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
+fn persist_request(
+    state: &AppState,
+    mut record: RequestRecord,
+    started: Instant,
+    provider: Option<&ProviderConfig>,
+) {
+    let elapsed = started.elapsed();
+    record.latency_ms = elapsed.as_secs_f64() * 1000.0;
+    if let Some(provider) = provider {
+        record.estimated_cost = provider.estimated_cost(&record.usage);
+    }
+    state
+        .metrics
+        .lock()
+        .expect("metrics poisoned")
+        .record(record.status < 400, elapsed);
+    if let Err(error) = state.store.lock().expect("store poisoned").record(&record) {
+        error!(%error, request_id = %record.request_id, "failed to persist request audit");
+    }
+}
+
+fn token_reservation(request: &ChatRequest) -> u64 {
+    let prompt_budget = serde_json::to_vec(&request.messages)
+        .map(|value| value.len() as u64)
+        .unwrap_or(0);
+    prompt_budget.saturating_add(request.max_tokens.unwrap_or(1024).max(1) as u64)
+}
+
 async fn root(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "name": "ai-gateway",
@@ -1618,20 +1980,27 @@ async fn chat(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    let request_id = request_id(&headers);
     let identity = match api_allowed(&state, &headers, false) {
         Ok(Some(principal)) => principal,
         Ok(None) => {
-            return error_response(
-                StatusCode::UNAUTHORIZED,
-                "invalid API key",
-                "authentication_error",
+            return with_request_id(
+                error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid API key",
+                    "authentication_error",
+                ),
+                &request_id,
             )
         }
         Err(error) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error.to_string(),
-                "internal_error",
+            return with_request_id(
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error.to_string(),
+                    "internal_error",
+                ),
+                &request_id,
             )
         }
     };
@@ -1642,20 +2011,23 @@ async fn chat(
         Principal::Managed(id) => format!("api-key:{id}"),
     };
     if !state.limiter.allow(&identity_name) {
-        return (
+        return with_request_id((
             StatusCode::TOO_MANY_REQUESTS,
             [(header::RETRY_AFTER, "60")],
             Json(json!({"error": {"message": "rate limit exceeded", "type": "rate_limit_error"}})),
         )
-            .into_response();
+            .into_response(), &request_id);
     }
     let request = match ChatRequest::parse(body) {
         Ok(request) => request,
         Err(error) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                error.to_string(),
-                "invalid_request_error",
+            return with_request_id(
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    error.to_string(),
+                    "invalid_request_error",
+                ),
+                &request_id,
             )
         }
     };
@@ -1663,118 +2035,155 @@ async fn chat(
         Principal::Managed(id) => Some(id),
         _ => None,
     };
+    let reserved_tokens = key_id.map(|_| token_reservation(&request)).unwrap_or(0);
     if let Some(id) = key_id {
-        let reserved = match state.store.lock().expect("store poisoned").reserve(id) {
+        let reserved = match state
+            .store
+            .lock()
+            .expect("store poisoned")
+            .reserve(id, reserved_tokens)
+        {
             Ok(value) => value,
             Err(error) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    error.to_string(),
-                    "internal_error",
+                return with_request_id(
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        error.to_string(),
+                        "internal_error",
+                    ),
+                    &request_id,
                 )
             }
         };
         if !reserved {
-            return error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "managed API key quota exceeded",
-                "quota_exceeded",
+            return with_request_id(
+                error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "managed API key quota exceeded",
+                    "quota_exceeded",
+                ),
+                &request_id,
             );
         }
     }
     if request.stream {
-        return stream_chat(state, request, key_id).await;
+        return stream_chat(state, request, key_id, reserved_tokens, request_id).await;
     }
     let started = Instant::now();
     match state.router.route(&state.client, &request).await {
-        Ok(response) => {
-            let elapsed = started.elapsed();
-            state
-                .metrics
-                .lock()
-                .expect("metrics poisoned")
-                .record(true, elapsed);
-            if let Err(error) = state.store.lock().expect("store poisoned").record(
-                true,
-                &response.usage,
-                elapsed,
+        Ok((provider, response)) => {
+            let record = RequestRecord {
+                request_id: request_id.clone(),
                 key_id,
-            ) {
-                error!(%error, "failed to persist usage");
-            }
-            (
-                StatusCode::OK,
-                Json(response_json(&response, request.model.as_deref())),
+                provider: provider.name.clone(),
+                model: provider.model.clone(),
+                stream: false,
+                status: StatusCode::OK.as_u16(),
+                latency_ms: 0.0,
+                usage: response.usage.clone(),
+                estimated_cost: 0.0,
+                reserved_tokens,
+                error: None,
+            };
+            persist_request(&state, record, started, Some(&provider));
+            with_request_id(
+                (
+                    StatusCode::OK,
+                    Json(response_json(&response, request.model.as_deref())),
+                )
+                    .into_response(),
+                &request_id,
             )
-                .into_response()
         }
         Err(error) => {
-            let elapsed = started.elapsed();
-            state
-                .metrics
-                .lock()
-                .expect("metrics poisoned")
-                .record(false, elapsed);
-            if let Err(store_error) = state.store.lock().expect("store poisoned").record(
-                false,
-                &Usage::default(),
-                elapsed,
+            let message = error.to_string();
+            let record = RequestRecord {
+                request_id: request_id.clone(),
                 key_id,
-            ) {
-                error!(%store_error, "failed to persist failed usage");
-            }
-            error_response(StatusCode::BAD_GATEWAY, error.to_string(), "provider_error")
+                provider: "unavailable".to_owned(),
+                model: request.model.clone().unwrap_or_else(|| "auto".to_owned()),
+                stream: false,
+                status: StatusCode::BAD_GATEWAY.as_u16(),
+                latency_ms: 0.0,
+                usage: Usage::default(),
+                estimated_cost: 0.0,
+                reserved_tokens,
+                error: Some(truncate(&message, 500)),
+            };
+            persist_request(&state, record, started, None);
+            with_request_id(
+                error_response(StatusCode::BAD_GATEWAY, message, "provider_error"),
+                &request_id,
+            )
         }
     }
 }
 
-async fn stream_chat(state: AppState, request: ChatRequest, key_id: Option<i64>) -> Response {
+async fn stream_chat(
+    state: AppState,
+    request: ChatRequest,
+    key_id: Option<i64>,
+    reserved_tokens: u64,
+    request_id: String,
+) -> Response {
     let started = Instant::now();
     match state.router.route_stream(&state.client, &request).await {
         Ok((provider, response, permit)) => {
-            let elapsed = started.elapsed();
-            state
-                .metrics
-                .lock()
-                .expect("metrics poisoned")
-                .record(true, elapsed);
-            if let Err(error) = state.store.lock().expect("store poisoned").record(
-                true,
-                &Usage::default(),
-                elapsed,
-                key_id,
-            ) {
-                error!(%error, "failed to persist streaming usage");
-            }
             let model = request.model.clone().unwrap_or(provider.model.clone());
-            let stream = provider_stream_body(response, &provider, model, permit);
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, "text/event-stream"),
-                    (header::CACHE_CONTROL, "no-cache"),
-                    (header::CONNECTION, "keep-alive"),
-                ],
-                Body::from_stream(stream),
+            let audit = StreamAudit {
+                state: state.clone(),
+                provider: provider.clone(),
+                record: RequestRecord {
+                    request_id: request_id.clone(),
+                    key_id,
+                    provider: provider.name.clone(),
+                    model: provider.model.clone(),
+                    stream: true,
+                    status: 499,
+                    latency_ms: 0.0,
+                    usage: Usage::default(),
+                    estimated_cost: 0.0,
+                    reserved_tokens,
+                    error: None,
+                },
+                started,
+                terminal: false,
+            };
+            let stream = provider_stream_body(response, &provider, model, permit, audit);
+            with_request_id(
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "text/event-stream"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                        (header::CONNECTION, "keep-alive"),
+                    ],
+                    Body::from_stream(stream),
+                )
+                    .into_response(),
+                &request_id,
             )
-                .into_response()
         }
         Err(error) => {
-            let elapsed = started.elapsed();
-            state
-                .metrics
-                .lock()
-                .expect("metrics poisoned")
-                .record(false, elapsed);
-            if let Err(store_error) = state.store.lock().expect("store poisoned").record(
-                false,
-                &Usage::default(),
-                elapsed,
+            let message = error.to_string();
+            let record = RequestRecord {
+                request_id: request_id.clone(),
                 key_id,
-            ) {
-                error!(%store_error, "failed to persist failed streaming usage");
-            }
-            error_response(StatusCode::BAD_GATEWAY, error.to_string(), "provider_error")
+                provider: "unavailable".to_owned(),
+                model: request.model.clone().unwrap_or_else(|| "auto".to_owned()),
+                stream: true,
+                status: StatusCode::BAD_GATEWAY.as_u16(),
+                latency_ms: 0.0,
+                usage: Usage::default(),
+                estimated_cost: 0.0,
+                reserved_tokens,
+                error: Some(truncate(&message, 500)),
+            };
+            persist_request(&state, record, started, None);
+            with_request_id(
+                error_response(StatusCode::BAD_GATEWAY, message, "provider_error"),
+                &request_id,
+            )
         }
     }
 }
@@ -1803,6 +2212,56 @@ async fn admin_stats(State(state): State<AppState>, headers: HeaderMap) -> Respo
         );
     }
     match state.store.lock().expect("store poisoned").stats() {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.to_string(),
+            "internal_error",
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct RequestsQuery {
+    limit: Option<usize>,
+}
+
+async fn admin_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RequestsQuery>,
+) -> Response {
+    if !matches!(admin_allowed(&state, &headers), Ok(true)) {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "admin API key required",
+            "authentication_error",
+        );
+    }
+    match state
+        .store
+        .lock()
+        .expect("store poisoned")
+        .requests(query.limit.unwrap_or(50))
+    {
+        Ok(requests) => (StatusCode::OK, Json(json!({"data": requests}))).into_response(),
+        Err(error) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.to_string(),
+            "internal_error",
+        ),
+    }
+}
+
+async fn admin_breakdown(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !matches!(admin_allowed(&state, &headers), Ok(true)) {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "admin API key required",
+            "authentication_error",
+        );
+    }
+    match state.store.lock().expect("store poisoned").breakdown() {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1898,6 +2357,8 @@ fn build_app(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat))
         .route("/chat/completions", post(chat))
         .route("/admin/stats", get(admin_stats))
+        .route("/admin/requests", get(admin_requests))
+        .route("/admin/breakdown", get(admin_breakdown))
         .route("/admin/api-keys", get(list_keys).post(create_key))
         .route("/admin/api-keys/{id}", delete(revoke_key))
         .with_state(state)
@@ -1940,6 +2401,7 @@ async fn main() -> Result<()> {
             json!({
                 "valid": true,
                 "listen": format!("{}:{}", config.server.host, config.server.port),
+                "audit_retention_days": config.server.audit_retention_days,
                 "auth": {
                     "api_key": config.server.api_key.is_some(),
                     "admin_api_key": config.server.admin_api_key.is_some()
@@ -1949,7 +2411,9 @@ async fn main() -> Result<()> {
                     "kind": provider.kind,
                     "model": provider.model,
                     "base_url": provider.base_url,
-                    "authenticated": provider.api_key.is_some()
+                    "authenticated": provider.api_key.is_some(),
+                    "input_price_per_million": provider.input_price_per_million,
+                    "output_price_per_million": provider.output_price_per_million
                 })).collect::<Vec<_>>()
             })
         );
@@ -1964,7 +2428,10 @@ async fn main() -> Result<()> {
         .timeout(timeout)
         .user_agent(format!("ai-gateway/{VERSION}"))
         .build()?;
-    let store = Store::open(&config.server.database_path)?;
+    let store = Store::open_with_retention(
+        &config.server.database_path,
+        config.server.audit_retention_days,
+    )?;
     let state = AppState {
         router: Arc::new(RouterState::new(&config)),
         limiter: Arc::new(RateLimiter::new(config.server.rate_limit_per_minute)),
@@ -1998,6 +2465,7 @@ struct RawServer {
     database_path: Option<String>,
     rate_limit_per_minute: Option<usize>,
     request_timeout_seconds: Option<f64>,
+    audit_retention_days: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -2022,6 +2490,8 @@ struct RawProvider {
     timeout_seconds: Option<f64>,
     priority: Option<i64>,
     max_concurrency: Option<usize>,
+    input_price_per_million: Option<f64>,
+    output_price_per_million: Option<f64>,
     headers: Option<HashMap<String, String>>,
 }
 
@@ -2073,6 +2543,7 @@ fn parse_file_config(path: &FsPath) -> Result<Config> {
         )?,
         rate_limit_per_minute: server_raw.rate_limit_per_minute.unwrap_or(0),
         request_timeout_seconds: positive(default_timeout, "server.request_timeout_seconds")?,
+        audit_retention_days: server_raw.audit_retention_days.unwrap_or(30),
     };
     let routing = RoutingConfig {
         default_model: routing_raw
@@ -2140,6 +2611,22 @@ fn env_config() -> Result<Config> {
                 .transpose()?
                 .unwrap_or(32)
                 .max(1),
+            input_price_per_million: nonnegative(
+                env::var("AI_GATEWAY_UPSTREAM_INPUT_PRICE")
+                    .ok()
+                    .map(|value| value.parse())
+                    .transpose()?
+                    .unwrap_or(0.0),
+                "AI_GATEWAY_UPSTREAM_INPUT_PRICE",
+            )?,
+            output_price_per_million: nonnegative(
+                env::var("AI_GATEWAY_UPSTREAM_OUTPUT_PRICE")
+                    .ok()
+                    .map(|value| value.parse())
+                    .transpose()?
+                    .unwrap_or(0.0),
+                "AI_GATEWAY_UPSTREAM_OUTPUT_PRICE",
+            )?,
             headers: HashMap::new(),
         });
     }
@@ -2157,6 +2644,8 @@ fn env_config() -> Result<Config> {
             timeout_seconds: 45.0,
             priority: 30,
             max_concurrency: 64,
+            input_price_per_million: 0.0,
+            output_price_per_million: 0.0,
             headers: HashMap::new(),
         });
     }
@@ -2175,6 +2664,8 @@ fn env_config() -> Result<Config> {
             timeout_seconds: 45.0,
             priority: 20,
             max_concurrency: 32,
+            input_price_per_million: 0.0,
+            output_price_per_million: 0.0,
             headers: HashMap::new(),
         });
     }
@@ -2192,6 +2683,8 @@ fn env_config() -> Result<Config> {
             timeout_seconds: 45.0,
             priority: 20,
             max_concurrency: 32,
+            input_price_per_million: 0.0,
+            output_price_per_million: 0.0,
             headers: HashMap::new(),
         });
     }
@@ -2209,6 +2702,8 @@ fn env_config() -> Result<Config> {
             timeout_seconds: 45.0,
             priority: 10,
             max_concurrency: 8,
+            input_price_per_million: 0.0,
+            output_price_per_million: 0.0,
             headers: HashMap::new(),
         });
     }
@@ -2241,6 +2736,11 @@ fn env_config() -> Result<Config> {
                     .unwrap_or(45.0),
                 "AI_GATEWAY_TIMEOUT",
             )?,
+            audit_retention_days: env::var("AI_GATEWAY_AUDIT_RETENTION_DAYS")
+                .ok()
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(30),
         },
         routing: RoutingConfig {
             default_model: "auto".to_owned(),
@@ -2299,6 +2799,14 @@ fn provider_from_raw(raw: RawProvider, default_timeout: f64) -> Result<ProviderC
         )?,
         priority: raw.priority.unwrap_or(0),
         max_concurrency: raw.max_concurrency.unwrap_or(16).max(1),
+        input_price_per_million: nonnegative(
+            raw.input_price_per_million.unwrap_or(0.0),
+            "provider.input_price_per_million",
+        )?,
+        output_price_per_million: nonnegative(
+            raw.output_price_per_million.unwrap_or(0.0),
+            "provider.output_price_per_million",
+        )?,
         headers: raw.headers.unwrap_or_default(),
     })
 }
@@ -2492,6 +3000,8 @@ mod tests {
             timeout_seconds: 1.0,
             priority,
             max_concurrency: 2,
+            input_price_per_million: 0.0,
+            output_price_per_million: 0.0,
             headers: HashMap::new(),
         }
     }
@@ -2561,12 +3071,12 @@ mod tests {
 
     #[test]
     fn managed_key_limits_survive_creation_and_usage() {
-        let mut store = Store::open(":memory:").unwrap();
+        let mut store = Store::open_with_retention(":memory:", 30).unwrap();
         let (_, key) = store.create_key("limited", Some(1), Some(10)).unwrap();
         assert_eq!(key.request_limit, Some(1));
         assert_eq!(key.token_limit, Some(10));
-        assert!(store.reserve(key.id).unwrap());
-        assert!(!store.reserve(key.id).unwrap());
+        assert!(store.reserve(key.id, 1).unwrap());
+        assert!(!store.reserve(key.id, 1).unwrap());
     }
 
     #[test]
@@ -2582,6 +3092,147 @@ mod tests {
     }
 
     #[test]
+    fn streaming_usage_is_collected_across_provider_events() {
+        let mut normalizer = StreamNormalizer::new("anthropic".to_owned(), "claude".to_owned());
+        normalizer.process_line(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":11}},"usage":{"input_tokens":11}}"#,
+        );
+        normalizer.process_line(
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
+        );
+        let usage = normalizer.usage();
+        assert_eq!(usage.prompt_tokens, 11);
+        assert_eq!(usage.completion_tokens, 7);
+        assert_eq!(usage.total_tokens, 18);
+    }
+
+    #[test]
+    fn openai_sse_usage_collector_handles_fragmented_chunks() {
+        let mut collector = SseUsageCollector::default();
+        collector.push(b"data: {\"choices\":[],\"usa");
+        collector
+            .push(b"ge\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}\n\n");
+        let usage = collector.finish();
+        assert_eq!(usage.prompt_tokens, 3);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 8);
+    }
+
+    #[test]
+    fn token_reservations_prevent_concurrent_overshoot_and_are_released() {
+        let mut store = Store::open_with_retention(":memory:", 30).unwrap();
+        let (_, key) = store.create_key("budget", None, Some(10)).unwrap();
+        assert!(store.reserve(key.id, 6).unwrap());
+        assert!(!store.reserve(key.id, 5).unwrap());
+        store
+            .record(&RequestRecord {
+                request_id: "req_one".to_owned(),
+                key_id: Some(key.id),
+                provider: "test".to_owned(),
+                model: "test-model".to_owned(),
+                stream: false,
+                status: 200,
+                latency_ms: 10.0,
+                usage: Usage {
+                    prompt_tokens: 2,
+                    completion_tokens: 2,
+                    total_tokens: 4,
+                },
+                estimated_cost: 0.0,
+                reserved_tokens: 6,
+                error: None,
+            })
+            .unwrap();
+        assert!(store.reserve(key.id, 6).unwrap());
+    }
+
+    #[test]
+    fn request_audit_exposes_recent_records_and_provider_breakdown() {
+        let mut store = Store::open_with_retention(":memory:", 30).unwrap();
+        let record = RequestRecord {
+            request_id: "req_audit".to_owned(),
+            key_id: None,
+            provider: "primary".to_owned(),
+            model: "model-a".to_owned(),
+            stream: true,
+            status: 200,
+            latency_ms: 25.0,
+            usage: Usage {
+                prompt_tokens: 4,
+                completion_tokens: 6,
+                total_tokens: 10,
+            },
+            estimated_cost: 0.002,
+            reserved_tokens: 0,
+            error: None,
+        };
+        store.record(&record).unwrap();
+        store.record(&record).unwrap();
+        let requests = store.requests(10).unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["request_id"], "req_audit");
+        assert_eq!(requests[0]["total_tokens"], 10);
+        let breakdown = store.breakdown().unwrap();
+        assert_eq!(breakdown["providers"][0]["provider"], "primary");
+        assert_eq!(breakdown["providers"][0]["requests"], 2);
+        assert_eq!(breakdown["providers"][0]["estimated_cost"], 0.004);
+    }
+
+    #[test]
+    fn audit_retention_removes_expired_records() {
+        let mut store = Store::open_with_retention(":memory:", 1).unwrap();
+        let record = RequestRecord {
+            request_id: "old".to_owned(),
+            key_id: None,
+            provider: "test".to_owned(),
+            model: "model".to_owned(),
+            stream: false,
+            status: 200,
+            latency_ms: 1.0,
+            usage: Usage::default(),
+            estimated_cost: 0.0,
+            reserved_tokens: 0,
+            error: None,
+        };
+        store.record(&record).unwrap();
+        store
+            .connection
+            .execute("UPDATE requests SET created_at=0", [])
+            .unwrap();
+        let mut current = record;
+        current.request_id = "current".to_owned();
+        store.record(&current).unwrap();
+        let requests = store.requests(10).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["request_id"], "current");
+    }
+
+    #[test]
+    fn request_ids_accept_safe_values_and_replace_unsafe_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("client_request-1"));
+        assert_eq!(request_id(&headers), "client_request-1");
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_static("unsafe request id"),
+        );
+        assert!(request_id(&headers).starts_with("req_"));
+    }
+
+    #[test]
+    fn provider_cost_uses_separate_input_and_output_prices() {
+        let mut config = provider("priced", "model", 1);
+        config.input_price_per_million = 2.0;
+        config.output_price_per_million = 8.0;
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 500_000,
+            total_tokens: 1_500_000,
+        };
+        assert_eq!(config.estimated_cost(&usage), 6.0);
+    }
+
+    #[test]
     fn router_applies_default_model_and_priority() {
         let config = Config {
             server: ServerConfig {
@@ -2592,6 +3243,7 @@ mod tests {
                 database_path: ":memory:".to_owned(),
                 rate_limit_per_minute: 0,
                 request_timeout_seconds: 1.0,
+                audit_retention_days: 30,
             },
             routing: RoutingConfig {
                 default_model: "second".to_owned(),
@@ -2621,6 +3273,7 @@ mod tests {
                 database_path: ":memory:".to_owned(),
                 rate_limit_per_minute: 0,
                 request_timeout_seconds: 1.0,
+                audit_retention_days: 30,
             },
             routing: RoutingConfig {
                 default_model: "auto".to_owned(),
