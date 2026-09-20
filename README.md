@@ -75,6 +75,14 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
+Streaming uses the same endpoint and the standard OpenAI SSE format:
+
+```bash
+curl --no-buffer http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"auto","stream":true,"messages":[{"role":"user","content":"Stream three short ideas."}]}'
+```
+
 ```python
 from openai import OpenAI
 
@@ -113,6 +121,7 @@ Any OpenAI-compatible vendor can be added with `OPENAI_BASE_URL`, or declared ex
 ## What You Get
 
 - **Provider abstraction**: OpenAI-compatible, Anthropic, Gemini, and Ollama request/response normalization.
+- **Streaming**: provider-native streams are forwarded or normalized to one OpenAI-compatible SSE contract.
 - **Routing**: select a model, provider name, or task route; priorities define the normal order.
 - **Failover**: bounded retries and a cooldown for providers that repeatedly fail.
 - **Access control**: optional gateway/admin bearer keys plus hashed, revocable client keys.
@@ -206,7 +215,7 @@ Secrets can be referenced with `api_key_env` instead of putting them in JSON. Th
 | `GET/POST` | `/admin/api-keys` | admin key | List or create client keys |
 | `DELETE` | `/admin/api-keys/:id` | admin key | Revoke a client key |
 
-Streaming is intentionally rejected in `0.3.0` so every adapter has the same predictable response contract. The next compatibility milestone is provider-native streaming with a consistent SSE layer.
+Streaming requests use the same OpenAI-compatible SSE contract across all adapters. OpenAI-compatible providers pass through native chunks; Anthropic, Gemini, and Ollama are normalized to `chat.completion.chunk` events.
 
 ## Build And Test
 

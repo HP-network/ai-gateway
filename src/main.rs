@@ -1,11 +1,15 @@
 use anyhow::{anyhow, Context, Result};
+use async_stream::try_stream;
 use axum::{
+    body::Body,
     extract::{DefaultBodyLimit, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
+use bytes::Bytes;
+use futures_util::StreamExt;
 use reqwest::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -13,9 +17,10 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
-    env, fs,
+    env, fs, io,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -23,7 +28,7 @@ use tokio::net::TcpListener;
 use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
 use tracing::{error, info};
 
-const VERSION: &str = "0.3.0";
+const VERSION: &str = "0.4.0";
 const MAX_BODY_BYTES: usize = 2_000_000;
 
 #[derive(Clone)]
@@ -258,6 +263,58 @@ impl RouterState {
         Err(anyhow!("all providers failed: {}", errors.join("; ")))
     }
 
+    async fn route_stream(
+        &self,
+        client: &Client,
+        request: &ChatRequest,
+    ) -> Result<(ProviderConfig, reqwest::Response)> {
+        let candidates = self.candidates(request);
+        if candidates.is_empty() {
+            return Err(anyhow!("no healthy provider matches this request"));
+        }
+        let attempts = candidates
+            .len()
+            .min(self.routing.max_retries.saturating_add(1));
+        let mut errors = Vec::new();
+        for index in candidates.into_iter().take(attempts) {
+            let (provider, started) = {
+                let mut runtime = self.providers[index]
+                    .lock()
+                    .expect("provider state poisoned");
+                runtime.requests += 1;
+                (runtime.config.clone(), Instant::now())
+            };
+            match provider_stream(client, &provider, request).await {
+                Ok(response) => {
+                    let mut runtime = self.providers[index]
+                        .lock()
+                        .expect("provider state poisoned");
+                    runtime.failures = 0;
+                    runtime.unavailable_until = None;
+                    runtime.latency_total += started.elapsed();
+                    return Ok((provider, response));
+                }
+                Err(error) => {
+                    let elapsed = started.elapsed();
+                    let mut runtime = self.providers[index]
+                        .lock()
+                        .expect("provider state poisoned");
+                    runtime.errors += 1;
+                    runtime.failures += 1;
+                    runtime.latency_total += elapsed;
+                    if runtime.failures >= 2 {
+                        runtime.unavailable_until = Some(
+                            Instant::now()
+                                + Duration::from_secs_f64(self.routing.failure_cooldown_seconds),
+                        );
+                    }
+                    errors.push(format!("{}: {error}", provider.name));
+                }
+            }
+        }
+        Err(anyhow!("all providers failed: {}", errors.join("; ")))
+    }
+
     fn candidates(&self, request: &ChatRequest) -> Vec<usize> {
         let route_names = request
             .task
@@ -364,6 +421,7 @@ struct ChatRequest {
     messages: Vec<Message>,
     temperature: Option<f64>,
     max_tokens: Option<i64>,
+    stream: bool,
     task: Option<String>,
     extra: Map<String, Value>,
 }
@@ -429,13 +487,10 @@ impl ChatRequest {
         if max_tokens.map(|value| value < 1).unwrap_or(false) {
             return Err(anyhow!("max_tokens must be a positive integer"));
         }
-        if object
+        let stream = object
             .get("stream")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            return Err(anyhow!("streaming responses are not supported yet"));
-        }
+            .unwrap_or(false);
         let task = optional_nonempty_string(object.get("task"))?;
         let mut extra = object.clone();
         for key in [
@@ -453,6 +508,7 @@ impl ChatRequest {
             messages,
             temperature,
             max_tokens,
+            stream,
             task,
             extra,
         })
@@ -524,6 +580,45 @@ async fn provider_chat(
     provider: &ProviderConfig,
     request: &ChatRequest,
 ) -> Result<ChatResponse> {
+    let response = provider_request(client, provider, request, false)?
+        .send()
+        .await?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() {
+        return Err(anyhow!(
+            "provider returned HTTP {status}: {}",
+            body.to_string().chars().take(500).collect::<String>()
+        ));
+    }
+    normalize_response(provider, body)
+}
+
+async fn provider_stream(
+    client: &Client,
+    provider: &ProviderConfig,
+    request: &ChatRequest,
+) -> Result<reqwest::Response> {
+    let response = provider_request(client, provider, request, true)?
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "provider returned HTTP {status}: {}",
+            body.chars().take(500).collect::<String>()
+        ));
+    }
+    Ok(response)
+}
+
+fn provider_request(
+    client: &Client,
+    provider: &ProviderConfig,
+    request: &ChatRequest,
+    stream: bool,
+) -> Result<reqwest::RequestBuilder> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(reqwest::header::CONTENT_TYPE, "application/json".parse()?);
     for (name, value) in &provider.headers {
@@ -540,7 +635,7 @@ async fn provider_chat(
                 "messages".to_owned(),
                 serde_json::to_value(&request.messages)?,
             );
-            body.insert("stream".to_owned(), Value::Bool(false));
+            body.insert("stream".to_owned(), Value::Bool(stream));
             if let Some(value) = request.temperature {
                 body.insert("temperature".to_owned(), json!(value));
             }
@@ -572,6 +667,7 @@ async fn provider_chat(
                 json!(request.max_tokens.unwrap_or(1024)),
             );
             body.insert("messages".to_owned(), Value::Array(messages));
+            body.insert("stream".to_owned(), Value::Bool(stream));
             if !system.is_empty() {
                 body.insert("system".to_owned(), Value::String(system.join("\n")));
             }
@@ -601,9 +697,14 @@ async fn provider_chat(
             }
             (
                 format!(
-                    "{}/v1beta/models/{}:generateContent",
+                    "{}/v1beta/models/{}:{}",
                     provider.base_url.trim_end_matches('/'),
-                    provider.model
+                    provider.model,
+                    if stream {
+                        "streamGenerateContent"
+                    } else {
+                        "generateContent"
+                    }
                 ),
                 Value::Object(body),
             )
@@ -615,7 +716,7 @@ async fn provider_chat(
                 "messages".to_owned(),
                 serde_json::to_value(&request.messages)?,
             );
-            body.insert("stream".to_owned(), Value::Bool(false));
+            body.insert("stream".to_owned(), Value::Bool(stream));
             if let Some(value) = request.temperature {
                 body.insert("options".to_owned(), json!({"temperature": value}));
             }
@@ -645,19 +746,240 @@ async fn provider_chat(
             if let Some(key) = &provider.api_key {
                 builder = builder.query(&[("key", key)]);
             }
+            if stream {
+                builder = builder.query(&[("alt", "sse")]);
+            }
         }
         _ => {}
     }
-    let response = builder.json(&payload).send().await?;
-    let status = response.status();
-    let body: Value = response.json().await.unwrap_or_else(|_| json!({}));
-    if !status.is_success() {
-        return Err(anyhow!(
-            "provider returned HTTP {status}: {}",
-            body.to_string().chars().take(500).collect::<String>()
-        ));
+    Ok(builder.json(&payload))
+}
+
+type ByteStream = Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, io::Error>> + Send>>;
+
+fn provider_stream_body(
+    response: reqwest::Response,
+    provider: &ProviderConfig,
+    model: String,
+) -> ByteStream {
+    if matches!(provider.kind.as_str(), "openai" | "openai-compatible") {
+        return Box::pin(
+            response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(|error| io::Error::other(error.to_string()))),
+        );
     }
-    normalize_response(provider, body)
+    let kind = provider.kind.clone();
+    let stream = try_stream! {
+        let mut source = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut normalizer = StreamNormalizer::new(kind, model);
+        yield normalizer.initial();
+        while let Some(chunk) = source.next().await {
+            let chunk = chunk.map_err(|error| io::Error::other(error.to_string()))?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(position) = buffer.find('\n') {
+                let line = buffer[..position].trim_end_matches('\r').to_owned();
+                buffer.drain(..=position);
+                for frame in normalizer.process_line(&line) {
+                    yield frame;
+                }
+            }
+        }
+        if !buffer.trim().is_empty() {
+            for frame in normalizer.process_line(buffer.trim()) {
+                yield frame;
+            }
+        }
+        for frame in normalizer.finish() {
+            yield frame;
+        }
+    };
+    Box::pin(stream)
+}
+
+struct StreamNormalizer {
+    kind: String,
+    id: String,
+    created: i64,
+    model: String,
+    finished: bool,
+}
+
+impl StreamNormalizer {
+    fn new(kind: String, model: String) -> Self {
+        Self {
+            kind,
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
+            created: unix_now(),
+            model,
+            finished: false,
+        }
+    }
+
+    fn initial(&mut self) -> Bytes {
+        stream_chunk(
+            &self.id,
+            self.created,
+            &self.model,
+            Some("assistant"),
+            "",
+            None,
+        )
+    }
+
+    fn process_line(&mut self, line: &str) -> Vec<Bytes> {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("event:") {
+            return Vec::new();
+        }
+        let data = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
+        if data.is_empty() || data == "[DONE]" {
+            self.finished = true;
+            return vec![stream_done()];
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return Vec::new();
+        };
+        match self.kind.as_str() {
+            "anthropic" => self.anthropic(value),
+            "gemini" => self.gemini(value),
+            "ollama" => self.ollama(value),
+            _ => Vec::new(),
+        }
+    }
+
+    fn anthropic(&mut self, value: Value) -> Vec<Bytes> {
+        match value.get("type").and_then(Value::as_str) {
+            Some("content_block_delta") => value
+                .get("delta")
+                .and_then(|delta| delta.get("text"))
+                .and_then(Value::as_str)
+                .map(|text| {
+                    vec![stream_chunk(
+                        &self.id,
+                        self.created,
+                        &self.model,
+                        None,
+                        text,
+                        None,
+                    )]
+                })
+                .unwrap_or_default(),
+            Some("message_delta") => {
+                let reason = value
+                    .get("delta")
+                    .and_then(|delta| delta.get("stop_reason"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("stop");
+                self.finish_with(reason)
+            }
+            Some("message_stop") => self.finish_with("stop"),
+            _ => Vec::new(),
+        }
+    }
+
+    fn gemini(&mut self, value: Value) -> Vec<Bytes> {
+        let mut frames = Vec::new();
+        if let Some(parts) = value
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .and_then(|candidate| candidate.get("content"))
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+        {
+            for text in parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+            {
+                frames.push(stream_chunk(
+                    &self.id,
+                    self.created,
+                    &self.model,
+                    None,
+                    text,
+                    None,
+                ));
+            }
+        }
+        if value
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .and_then(|candidate| candidate.get("finishReason"))
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            frames.extend(self.finish_with("stop"));
+        }
+        frames
+    }
+
+    fn ollama(&mut self, value: Value) -> Vec<Bytes> {
+        let mut frames = Vec::new();
+        if let Some(text) = value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            frames.push(stream_chunk(
+                &self.id,
+                self.created,
+                &self.model,
+                None,
+                text,
+                None,
+            ));
+        }
+        if value.get("done").and_then(Value::as_bool).unwrap_or(false) {
+            frames.extend(self.finish_with("stop"));
+        }
+        frames
+    }
+
+    fn finish_with(&mut self, reason: &str) -> Vec<Bytes> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        vec![
+            stream_chunk(&self.id, self.created, &self.model, None, "", Some(reason)),
+            stream_done(),
+        ]
+    }
+
+    fn finish(&mut self) -> Vec<Bytes> {
+        self.finish_with("stop")
+    }
+}
+
+fn stream_chunk(
+    id: &str,
+    created: i64,
+    model: &str,
+    role: Option<&str>,
+    content: &str,
+    finish_reason: Option<&str>,
+) -> Bytes {
+    let mut delta = Map::new();
+    if let Some(role) = role {
+        delta.insert("role".to_owned(), Value::String(role.to_owned()));
+    }
+    delta.insert("content".to_owned(), Value::String(content.to_owned()));
+    let value = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
+    });
+    Bytes::from(format!("data: {}\n\n", value))
+}
+
+fn stream_done() -> Bytes {
+    Bytes::from_static(b"data: [DONE]\n\n")
 }
 
 fn normalize_response(provider: &ProviderConfig, body: Value) -> Result<ChatResponse> {
@@ -1263,6 +1585,9 @@ async fn chat(
             );
         }
     }
+    if request.stream {
+        return stream_chat(state, request, key_id).await;
+    }
     let started = Instant::now();
     match state.router.route(&state.client, &request).await {
         Ok(response) => {
@@ -1300,6 +1625,57 @@ async fn chat(
                 key_id,
             ) {
                 error!(%store_error, "failed to persist failed usage");
+            }
+            error_response(StatusCode::BAD_GATEWAY, error.to_string(), "provider_error")
+        }
+    }
+}
+
+async fn stream_chat(state: AppState, request: ChatRequest, key_id: Option<i64>) -> Response {
+    let started = Instant::now();
+    match state.router.route_stream(&state.client, &request).await {
+        Ok((provider, response)) => {
+            let elapsed = started.elapsed();
+            state
+                .metrics
+                .lock()
+                .expect("metrics poisoned")
+                .record(true, elapsed);
+            if let Err(error) = state.store.lock().expect("store poisoned").record(
+                true,
+                &Usage::default(),
+                elapsed,
+                key_id,
+            ) {
+                error!(%error, "failed to persist streaming usage");
+            }
+            let model = request.model.clone().unwrap_or(provider.model.clone());
+            let stream = provider_stream_body(response, &provider, model);
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "text/event-stream"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                    (header::CONNECTION, "keep-alive"),
+                ],
+                Body::from_stream(stream),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            let elapsed = started.elapsed();
+            state
+                .metrics
+                .lock()
+                .expect("metrics poisoned")
+                .record(false, elapsed);
+            if let Err(store_error) = state.store.lock().expect("store poisoned").record(
+                false,
+                &Usage::default(),
+                elapsed,
+                key_id,
+            ) {
+                error!(%store_error, "failed to persist failed streaming usage");
             }
             error_response(StatusCode::BAD_GATEWAY, error.to_string(), "provider_error")
         }
@@ -1905,17 +2281,53 @@ mod tests {
     }
 
     #[test]
-    fn rejects_streaming_and_non_finite_temperature() {
-        assert!(ChatRequest::parse(json!({
+    fn parses_streaming_and_rejects_non_finite_temperature() {
+        let streaming = ChatRequest::parse(json!({
             "messages": [{"role": "user", "content": "x"}],
             "stream": true
         }))
-        .is_err());
+        .unwrap();
+        assert!(streaming.stream);
         assert!(ChatRequest::parse(json!({
             "messages": [{"role": "user", "content": "x"}],
             "temperature": "nan"
         }))
         .is_err());
+    }
+
+    #[test]
+    fn normalizes_ollama_stream_chunks_to_openai_sse() {
+        let mut normalizer = StreamNormalizer::new("ollama".to_owned(), "llama3.2".to_owned());
+        let initial = String::from_utf8(normalizer.initial().to_vec()).unwrap();
+        assert!(initial.contains("chat.completion.chunk"));
+        let frames = normalizer
+            .process_line(r#"{"message":{"role":"assistant","content":"hello"},"done":false}"#);
+        assert_eq!(frames.len(), 1);
+        let frame = String::from_utf8(frames[0].to_vec()).unwrap();
+        assert!(frame.contains("hello"));
+        let final_frames =
+            normalizer.process_line(r#"{"message":{"content":""},"done":true,"eval_count":2}"#);
+        assert_eq!(final_frames.len(), 2);
+        assert!(String::from_utf8(final_frames[1].to_vec())
+            .unwrap()
+            .contains("[DONE]"));
+    }
+
+    #[test]
+    fn normalizes_anthropic_stream_events_to_openai_sse() {
+        let mut normalizer =
+            StreamNormalizer::new("anthropic".to_owned(), "claude-haiku".to_owned());
+        let _ = normalizer.initial();
+        let frames = normalizer.process_line(
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}"#,
+        );
+        assert_eq!(frames.len(), 1);
+        assert!(String::from_utf8(frames[0].to_vec())
+            .unwrap()
+            .contains("hi"));
+        let final_frames = normalizer
+            .process_line(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#);
+        assert_eq!(final_frames.len(), 2);
     }
 
     #[test]

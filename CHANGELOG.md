@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0
+
+- Added OpenAI-compatible streaming responses over SSE.
+- Added streaming adapters for Anthropic, Gemini, and Ollama with normalized chunks.
+- Added provider request streaming and failover before the first chunk is sent.
+
 ## 0.3.0
 
 - Rewrote the runtime in Rust with Axum and Tokio for a small, high-concurrency process.
