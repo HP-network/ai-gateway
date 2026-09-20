@@ -1,0 +1,12 @@
+services:
+  ai-gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      AI_GATEWAY_API_KEY: ${AI_GATEWAY_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    volumes:
+      - ./config.example.json:/etc/ai-gateway/config.json:ro
