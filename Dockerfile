@@ -4,6 +4,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY dashboard.html ./dashboard.html
+COPY .env.example ./.env.example
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
