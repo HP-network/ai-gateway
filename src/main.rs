@@ -28,7 +28,7 @@ use tokio::net::TcpListener;
 use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
 use tracing::{error, info};
 
-const VERSION: &str = "0.4.0";
+const VERSION: &str = "0.4.1";
 const MAX_BODY_BYTES: usize = 2_000_000;
 
 #[derive(Clone)]
@@ -975,7 +975,7 @@ fn stream_chunk(
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
     });
-    Bytes::from(format!("data: {}\n\n", value))
+    Bytes::from(format!("data: {value}\n\n"))
 }
 
 fn stream_done() -> Bytes {

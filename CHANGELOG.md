@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1
+
+- Fixed a Clippy warning on the streaming SSE formatter so the release pipeline stays warning-free.
+
 ## 0.4.0
 
 - Added OpenAI-compatible streaming responses over SSE.
