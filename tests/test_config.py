@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ai_gateway.config import ConfigError, load_config
+from ai_gateway.config import ConfigError, config_from_env, load_config, load_config_or_env
 
 
 class ConfigTests(unittest.TestCase):
@@ -34,3 +34,21 @@ class ConfigTests(unittest.TestCase):
         })
         with self.assertRaises(ConfigError):
             load_config(path)
+
+    def test_environment_mode_needs_no_json_file(self) -> None:
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "openai-secret"}, clear=True):
+            config = config_from_env()
+        self.assertEqual(config.providers[0].name, "openai")
+        self.assertEqual(config.providers[0].api_key, "openai-secret")
+        self.assertEqual(config.server.port, 8080)
+
+    def test_environment_mode_keeps_ollama_as_local_fallback(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            config = config_from_env()
+        self.assertEqual([provider.name for provider in config.providers], ["ollama"])
+
+    def test_explicit_config_wins_over_environment_mode(self) -> None:
+        path = self.write({"providers": [{"name": "local", "kind": "ollama", "base_url": "http://localhost", "model": "llama"}]})
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "should-not-be-used"}, clear=True):
+            config = load_config_or_env(path)
+        self.assertEqual([provider.name for provider in config.providers], ["local"])

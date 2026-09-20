@@ -65,14 +65,25 @@ class GatewayService:
 
 def make_handler(service: GatewayService) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
-        server_version = "ai-gateway/0.1"
+        server_version = "ai-gateway/0.1.2"
 
         def do_GET(self) -> None:  # noqa: N802
-            if not service.authenticate(self._api_key()):
+            if self.path != "/" and not service.authenticate(self._api_key()):
                 self._json(HTTPStatus.UNAUTHORIZED, {"error": {"message": "invalid API key", "type": "authentication_error"}})
                 return
             if self.path == "/health" or self.path == "/v1/health":
                 self._json(HTTPStatus.OK, {"status": "ok", "providers": service.router.health()})
+            elif self.path == "/":
+                self._json(HTTPStatus.OK, {
+                    "name": "ai-gateway",
+                    "status": "ok",
+                    "endpoints": {
+                        "chat": "/v1/chat/completions",
+                        "models": "/v1/models",
+                        "health": "/health",
+                        "metrics": "/metrics",
+                    },
+                })
             elif self.path == "/metrics":
                 data = service.metrics.prometheus().encode("utf-8")
                 self.send_response(HTTPStatus.OK)

@@ -99,6 +99,124 @@ def load_config(path: str | Path) -> GatewayConfig:
     return GatewayConfig(server, routing, tuple(providers))
 
 
+def load_config_or_env(path: str | Path | None = None) -> GatewayConfig:
+    """Load an explicit config, then the configured path, or use environment mode."""
+    if path is not None:
+        return load_config(path)
+    configured_path = os.environ.get("AI_GATEWAY_CONFIG")
+    if configured_path:
+        return load_config(configured_path)
+    default_path = Path("config.json")
+    if default_path.exists():
+        return load_config(default_path)
+    return config_from_env()
+
+
+def config_from_env() -> GatewayConfig:
+    """Build a useful single-provider config without requiring a JSON file."""
+    providers: list[ProviderConfig] = []
+    _append_env_provider(
+        providers,
+        key_name="OPENAI_API_KEY",
+        name="openai",
+        kind="openai-compatible",
+        base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        priority=30,
+    )
+    _append_env_provider(
+        providers,
+        key_name="ANTHROPIC_API_KEY",
+        name="anthropic",
+        kind="anthropic",
+        base_url=os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+        model=os.environ.get("ANTHROPIC_MODEL", "claude-3-5-haiku-latest"),
+        priority=20,
+    )
+    _append_env_provider(
+        providers,
+        key_name="GEMINI_API_KEY",
+        name="gemini",
+        kind="gemini",
+        base_url=os.environ.get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com"),
+        model=os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"),
+        priority=20,
+    )
+
+    ollama_url = os.environ.get("OLLAMA_BASE_URL")
+    ollama_model = os.environ.get("OLLAMA_MODEL")
+    if ollama_url or ollama_model or not providers:
+        providers.append(ProviderConfig(
+            name="ollama",
+            kind="ollama",
+            base_url=(ollama_url or "http://127.0.0.1:11434").rstrip("/"),
+            model=ollama_model or "llama3.2",
+            priority=10,
+        ))
+
+    port = _env_integer("AI_GATEWAY_PORT", 8080, minimum=1)
+    if port > 65535:
+        raise ConfigError("AI_GATEWAY_PORT must be between 1 and 65535")
+    return GatewayConfig(
+        server=ServerConfig(
+            host=os.environ.get("AI_GATEWAY_HOST", "0.0.0.0"),
+            port=port,
+            api_key=os.environ.get("AI_GATEWAY_API_KEY") or None,
+            request_timeout_seconds=_env_number("AI_GATEWAY_TIMEOUT", 45.0, minimum=0.1),
+        ),
+        routing=RoutingConfig(
+            max_retries=_env_integer("AI_GATEWAY_MAX_RETRIES", 2),
+            failure_cooldown_seconds=_env_number("AI_GATEWAY_FAILURE_COOLDOWN", 30.0),
+        ),
+        providers=tuple(providers),
+    )
+
+
+def _append_env_provider(
+    providers: list[ProviderConfig],
+    *,
+    key_name: str,
+    name: str,
+    kind: str,
+    base_url: str,
+    model: str,
+    priority: int,
+) -> None:
+    api_key = os.environ.get(key_name)
+    if not api_key:
+        return
+    providers.append(ProviderConfig(
+        name=name,
+        kind=kind,
+        base_url=base_url.rstrip("/"),
+        model=model,
+        api_key=api_key,
+        priority=priority,
+    ))
+
+
+def _env_integer(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw, 10)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer") from exc
+    return _integer(value, name, minimum=minimum)
+
+
+def _env_number(name: str, default: float, *, minimum: float = 0) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a number") from exc
+    return _number(value, name, minimum=minimum)
+
+
 def _headers(value: Any, provider_name: str) -> dict[str, str]:
     if value is None:
         return {}

@@ -1,52 +1,112 @@
 # AI Gateway
 
-`ai-gateway` is a small, dependency-free LLM gateway for teams that need one stable OpenAI-compatible endpoint in front of several model providers.
+<p align="center">
+  <strong>One endpoint for OpenAI, Anthropic, Gemini, Ollama, and compatible providers.</strong><br>
+  Keep your app stable when models, vendors, or API keys change.
+</p>
 
-It keeps provider-specific request formats behind adapters and gives routing a single place to handle priority, task routes, retries, failure cooldowns, health reporting, and metrics.
+<p align="center">
+  <a href="https://github.com/HP-network/ai-gateway/actions/workflows/ci.yml"><img src="https://github.com/HP-network/ai-gateway/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/HP-network/ai-gateway/releases"><img src="https://img.shields.io/github/v/release/HP-network/ai-gateway" alt="Release"></a>
+  <a href="https://github.com/HP-network/ai-gateway/blob/main/LICENSE"><img src="https://img.shields.io/github/license/HP-network/ai-gateway" alt="License"></a>
+</p>
 
-## What it includes
+AI Gateway is a small self-hosted gateway that exposes one OpenAI-compatible API in front of several LLM providers. It routes requests, retries failures, reports provider health, and keeps provider-specific formats out of your application.
 
-- OpenAI-compatible providers, Anthropic Messages, Gemini `generateContent`, and Ollama
-- model or task-based routing with provider priority
-- bounded failover retries and a lightweight circuit cooldown after repeated failures
-- environment-based secret loading; secrets are not required in the JSON config
-- OpenAI-compatible `/v1/chat/completions` and `/v1/models` endpoints
-- `/health`, `/v1/health`, and Prometheus-style `/metrics`
-- standard-library-only runtime; no framework or SDK lock-in
-- Docker image, Compose example, configuration validation, and tests
+## Start In 30 Seconds
 
-Streaming requests are intentionally rejected until an adapter can preserve provider-specific streaming semantics. Non-streaming chat completions are supported consistently across all adapters.
+You only need one provider key. No JSON file is required.
 
-## Quick start
+```bash
+git clone https://github.com/HP-network/ai-gateway.git
+cd ai-gateway
 
-```sh
-cp config.example.json config.json
-export OPENAI_API_KEY=...
-PYTHONPATH=src python -m ai_gateway check-config --config config.json
-PYTHONPATH=src python -m ai_gateway serve --config config.json
+export OPENAI_API_KEY=sk-...
+python -m venv .venv && source .venv/bin/activate
+pip install .
+ai-gateway
 ```
 
-The example configuration listens on port `8080` on all interfaces. Bind it to `127.0.0.1` for a local-only process or put authentication and a reverse proxy in front of a shared deployment.
+The gateway listens on port `8080`. Send the same request you already send to OpenAI:
 
-```sh
+```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{
     "model": "auto",
-    "task": "chat",
-    "messages": [{"role": "user", "content": "Give me one short idea for a Minecraft plugin."}]
+    "messages": [{"role": "user", "content": "Give me one useful idea for a Minecraft plugin."}]
   }'
 ```
 
-Set `server.api_key_env` in the config to require a gateway bearer token:
+Existing OpenAI client code can point at the gateway by changing only `base_url`:
 
-```json
-{"server": {"api_key_env": "AI_GATEWAY_API_KEY"}}
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
+answer = client.chat.completions.create(
+    model="auto",
+    messages=[{"role": "user", "content": "hello"}],
+)
+print(answer.choices[0].message.content)
 ```
 
-## Routing
+The default environment mode automatically enables any provider whose key is present:
 
-Providers are tried in descending `priority` order. A request with `model` set to a configured provider name or model selects that provider. A request with `task` uses the ordered provider list under `routing.task_routes`.
+| Environment variable | Provider | Default model |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | OpenAI-compatible | `gpt-4o-mini` |
+| `ANTHROPIC_API_KEY` | Anthropic | `claude-3-5-haiku-latest` |
+| `GEMINI_API_KEY` | Gemini | `gemini-2.0-flash` |
+| `OLLAMA_MODEL` | Local Ollama | `llama3.2` |
+
+Set `OPENAI_MODEL`, `ANTHROPIC_MODEL`, `GEMINI_MODEL`, or `OLLAMA_MODEL` to change a default. If no cloud key is present, the gateway starts with Ollama as a local provider.
+
+## Docker
+
+```bash
+export OPENAI_API_KEY=sk-...
+docker compose up --build
+```
+
+Or use a local `.env` file:
+
+```bash
+cp .env.example .env
+# edit .env, then:
+docker compose up --build
+```
+
+The container uses the same environment-first setup and publishes port `8080`. Add `AI_GATEWAY_API_KEY` when the gateway itself should require a bearer token:
+
+```bash
+export AI_GATEWAY_API_KEY=change-me
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "authorization: Bearer $AI_GATEWAY_API_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"hello"}]}'
+```
+
+## What It Does
+
+- **One stable API**: OpenAI-compatible `/v1/chat/completions` and `/v1/models`.
+- **Provider adapters**: OpenAI-compatible APIs, Anthropic Messages, Gemini `generateContent`, and Ollama.
+- **Routing**: choose by provider name, model, or task; priority determines the default order.
+- **Failover**: bounded retries and a cooldown for providers that keep failing.
+- **Operations**: `/health`, `/v1/health`, and Prometheus-compatible `/metrics`.
+- **Security basics**: gateway bearer authentication and environment-based provider secrets.
+- **Small footprint**: Python standard library at runtime, Docker-ready, no framework lock-in.
+
+## Advanced Configuration
+
+Environment mode is the recommended starting point. Use a JSON file when you need explicit task routes, priorities, custom headers, or several models from the same vendor:
+
+```bash
+cp config.example.json config.json
+ai-gateway --config config.json
+```
+
+Example task routing:
 
 ```json
 {
@@ -61,36 +121,36 @@ Providers are tried in descending `priority` order. A request with `model` set t
 }
 ```
 
-After two consecutive failures a provider is temporarily removed from routing. A successful request resets its failure counter. `/v1/health` exposes provider state, request counts, failures, and average latency.
+Validate a file before deploying it:
 
-## Providers
-
-| `kind` | API | Required fields |
-| --- | --- | --- |
-| `openai-compatible` | OpenAI and compatible gateways | `base_url`, `model`, optional `api_key_env` |
-| `anthropic` | Anthropic Messages API | `base_url`, `model`, `api_key_env` |
-| `gemini` | Gemini `generateContent` | `base_url`, `model`, `api_key_env` |
-| `ollama` | Ollama `/api/chat` | `base_url`, `model` |
-
-Provider secrets should be supplied through `api_key_env` rather than committed to a config file.
-
-## Docker
-
-```sh
-export OPENAI_API_KEY=...
-docker compose up --build
+```bash
+ai-gateway check-config --config config.json
 ```
 
-For production, mount a private config file instead of using `config.example.json` and set an API key for the gateway itself.
+## API Endpoints
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible chat completion |
+| `GET` | `/v1/models` | Models currently configured |
+| `GET` | `/` | Service information and endpoint links |
+| `GET` | `/health` | Gateway and provider health |
+| `GET` | `/metrics` | Request counters and latency |
+
+Streaming is intentionally rejected for now so every adapter has consistent, predictable behavior. Non-streaming completions work across all providers.
+
+## Scope
+
+AI Gateway is infrastructure, not a hosted-service panel. It deliberately keeps the runtime small and inspectable: one endpoint, provider adapters, routing, failover, health, and metrics. Use it when an application needs a stable model endpoint without adding a database, an administration UI, or a vendor-specific SDK.
 
 ## Development
 
-```sh
+```bash
 PYTHONPATH=src python -m unittest discover -s tests -v
 python -m py_compile src/ai_gateway/*.py
 ```
 
-The project deliberately uses the Python standard library so the routing and adapter behavior stays inspectable and easy to embed. A framework-specific deployment can wrap `GatewayService` without changing provider logic.
+The code is split into configuration, provider adapters, routing, and the HTTP service so it can be embedded behind another server or extended with a new provider without changing client integrations.
 
 ## License
 

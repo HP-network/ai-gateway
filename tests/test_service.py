@@ -1,9 +1,12 @@
 import unittest
 from unittest.mock import patch
+from http.client import HTTPConnection
+from threading import Thread
 
 from ai_gateway.models import ChatResponse, GatewayConfig, ProviderConfig, RoutingConfig, ServerConfig
 from ai_gateway.router import Router
-from ai_gateway.service import GatewayService
+from ai_gateway.service import GatewayService, make_handler
+from http.server import ThreadingHTTPServer
 
 
 class ServiceTests(unittest.TestCase):
@@ -27,3 +30,16 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.service.metrics.successful_requests, 1)
         self.assertEqual(self.service.metrics.failed_requests, 0)
         self.assertIn("ai_gateway_requests_total 1", self.service.metrics.prometheus())
+
+    def test_root_describes_available_endpoints(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.service))
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        connection.request("GET", "/")
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertIn("/v1/chat/completions", response.read().decode())
+        connection.close()
