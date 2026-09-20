@@ -11,7 +11,7 @@
   <a href="https://github.com/HP-network/ai-gateway/blob/main/LICENSE"><img src="https://img.shields.io/github/license/HP-network/ai-gateway" alt="License"></a>
 </p>
 
-AI Gateway is a small self-hosted gateway that exposes one OpenAI-compatible API in front of several LLM providers. It routes requests, retries failures, reports provider health, and keeps provider-specific formats out of your application.
+AI Gateway is a self-hosted LLM gateway that exposes one OpenAI-compatible API in front of several providers. It routes requests, retries failures, reports provider health, tracks usage in SQLite, and keeps provider-specific formats out of your application.
 
 ## Start In 30 Seconds
 
@@ -62,6 +62,49 @@ The default environment mode automatically enables any provider whose key is pre
 
 Set `OPENAI_MODEL`, `ANTHROPIC_MODEL`, `GEMINI_MODEL`, or `OLLAMA_MODEL` to change a default. If no cloud key is present, the gateway starts with Ollama as a local provider.
 
+Useful gateway settings:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AI_GATEWAY_API_KEY` | unset | Shared application bearer key |
+| `AI_GATEWAY_ADMIN_API_KEY` | unset | Admin/dashboard bearer key |
+| `AI_GATEWAY_RATE_LIMIT` | `0` | Requests per minute per key; `0` disables it |
+| `AI_GATEWAY_DATABASE` | `ai-gateway.db` | SQLite database path |
+| `AI_GATEWAY_HOST` | `127.0.0.1` | Local bind address |
+| `AI_GATEWAY_PORT` | `8080` | Listen port |
+
+## Production Quick Start
+
+For a shared deployment, set separate gateway and admin credentials. The gateway key is used by applications; the admin key creates and revokes client keys and opens the dashboard.
+
+```bash
+export OPENAI_API_KEY=sk-...
+export AI_GATEWAY_API_KEY=gateway-internal-secret
+export AI_GATEWAY_ADMIN_API_KEY=admin-secret
+export AI_GATEWAY_RATE_LIMIT=120
+ai-gateway
+```
+
+Create a client key. The plaintext token is shown only in this response, so store it in your application secret manager:
+
+```bash
+curl -X POST http://127.0.0.1:8080/admin/api-keys \
+  -H 'authorization: Bearer admin-secret' \
+  -H 'content-type: application/json' \
+  -d '{"name":"my-app"}'
+```
+
+Use the returned `ag_...` token from then on:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'authorization: Bearer ag_...' \
+  -H 'content-type: application/json' \
+  -d '{"model":"auto","messages":[{"role":"user","content":"hello"}]}'
+```
+
+Open `http://127.0.0.1:8080/dashboard` to view provider state, request totals, latency, token totals, and managed keys. The dashboard never displays key plaintext.
+
 ## Docker
 
 ```bash
@@ -77,15 +120,18 @@ cp .env.example .env
 docker compose up --build
 ```
 
-The container uses the same environment-first setup and publishes port `8080`. Add `AI_GATEWAY_API_KEY` when the gateway itself should require a bearer token:
+The container uses the same environment-first setup and publishes port `8080`. SQLite data is kept in the `ai-gateway-data` volume. Set `AI_GATEWAY_ADMIN_API_KEY` to enable key management and the dashboard:
 
 ```bash
-export AI_GATEWAY_API_KEY=change-me
+export AI_GATEWAY_API_KEY=gateway-secret
+export AI_GATEWAY_ADMIN_API_KEY=admin-secret
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "authorization: Bearer $AI_GATEWAY_API_KEY" \
   -H 'content-type: application/json' \
   -d '{"messages":[{"role":"user","content":"hello"}]}'
 ```
+
+The Compose service includes a healthcheck on `/`. For a direct `docker run`, set `AI_GATEWAY_HOST=0.0.0.0` so the published port is reachable from outside the container.
 
 ## What It Does
 
@@ -93,8 +139,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - **Provider adapters**: OpenAI-compatible APIs, Anthropic Messages, Gemini `generateContent`, and Ollama.
 - **Routing**: choose by provider name, model, or task; priority determines the default order.
 - **Failover**: bounded retries and a cooldown for providers that keep failing.
-- **Operations**: `/health`, `/v1/health`, and Prometheus-compatible `/metrics`.
-- **Security basics**: gateway bearer authentication and environment-based provider secrets.
+- **Operations**: `/health`, `/v1/health`, Prometheus-compatible `/metrics`, and a built-in dashboard.
+- **Usage and access**: SQLite request/token totals, hashed managed keys, revocation, and per-identity rate limits.
+- **Security basics**: separate gateway/admin bearer credentials and environment-based provider secrets.
 - **Small footprint**: Python standard library at runtime, Docker-ready, no framework lock-in.
 
 ## Advanced Configuration
@@ -136,12 +183,17 @@ ai-gateway check-config --config config.json
 | `GET` | `/` | Service information and endpoint links |
 | `GET` | `/health` | Gateway and provider health |
 | `GET` | `/metrics` | Request counters and latency |
+| `GET` | `/dashboard` | Browser dashboard |
+| `GET` | `/admin/stats` | Usage totals (admin key required) |
+| `GET` | `/admin/api-keys` | Managed key metadata (admin key required) |
+| `POST` | `/admin/api-keys` | Create a managed key (admin key required) |
+| `DELETE` | `/admin/api-keys/:id` | Revoke a managed key (admin key required) |
 
 Streaming is intentionally rejected for now so every adapter has consistent, predictable behavior. Non-streaming completions work across all providers.
 
 ## Scope
 
-AI Gateway is infrastructure, not a hosted-service panel. It deliberately keeps the runtime small and inspectable: one endpoint, provider adapters, routing, failover, health, and metrics. Use it when an application needs a stable model endpoint without adding a database, an administration UI, or a vendor-specific SDK.
+AI Gateway is infrastructure, not a hosted-service panel. It deliberately keeps the runtime small and inspectable while covering the operational basics: one endpoint, provider adapters, routing, failover, health, usage, keys, rate limits, and a small administration UI. It does not attempt to replace a billing or multi-tenant SaaS platform.
 
 ## Development
 

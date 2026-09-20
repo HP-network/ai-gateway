@@ -1,6 +1,6 @@
 import unittest
 
-from ai_gateway.models import ChatRequest, RequestValidationError
+from ai_gateway.models import ChatRequest, ChatResponse, RequestValidationError, Usage
 
 
 class ModelTests(unittest.TestCase):
@@ -20,3 +20,16 @@ class ModelTests(unittest.TestCase):
             ChatRequest.from_dict({"messages": []})
         with self.assertRaises(RequestValidationError):
             ChatRequest.from_dict({"messages": [{"role": "user", "content": "x"}], "temperature": 3})
+
+    def test_rejects_non_finite_temperature(self) -> None:
+        with self.assertRaises(RequestValidationError):
+            ChatRequest.from_dict({"messages": [{"role": "user", "content": "x"}], "temperature": float("nan")})
+
+    def test_parses_gemini_usage_fields(self) -> None:
+        usage = Usage.from_dict({"promptTokenCount": 4, "candidatesTokenCount": 6, "totalTokenCount": 12})
+        self.assertEqual(usage.as_dict(), {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 12})
+
+    def test_completion_ids_are_unique(self) -> None:
+        first = ChatResponse("model", "one").as_openai()
+        second = ChatResponse("model", "two").as_openai()
+        self.assertNotEqual(first["id"], second["id"])

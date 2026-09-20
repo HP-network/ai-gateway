@@ -64,7 +64,8 @@ class Router:
                     "name": state.provider.config.name,
                     "kind": state.provider.config.kind,
                     "model": state.provider.config.model,
-                    "healthy": state.available,
+                    "healthy": state.requests > 0 and state.available and state.failures == 0,
+                    "status": self._status(state),
                     "failures": state.failures,
                     "requests": state.requests,
                     "errors": state.errors,
@@ -73,6 +74,14 @@ class Router:
                 for state in self.states.values()
             ]
 
+    @staticmethod
+    def _status(state: ProviderState) -> str:
+        if not state.requests:
+            return "unknown"
+        if not state.available:
+            return "unavailable"
+        return "healthy" if state.failures == 0 else "degraded"
+
     def _candidates(self, request: ChatRequest) -> list[ProviderState]:
         route_names = self.config.routing.task_routes.get(request.task or "")
         states = list(self.states.values())
@@ -80,8 +89,11 @@ class Router:
             index = {name: position for position, name in enumerate(route_names)}
             states = [state for state in states if state.provider.config.name in index]
             states.sort(key=lambda state: index[state.provider.config.name])
-        elif request.model and request.model not in {"auto", ""}:
-            exact = [state for state in states if state.provider.config.model == request.model or state.provider.config.name == request.model]
+        else:
+            requested_model = request.model or self.config.routing.default_model
+            if requested_model in {"auto", ""}:
+                requested_model = None
+            exact = [state for state in states if requested_model and (state.provider.config.model == requested_model or state.provider.config.name == requested_model)]
             if exact:
                 states = exact
         states = [state for state in states if state.available]

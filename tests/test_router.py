@@ -40,3 +40,19 @@ class RouterTests(unittest.TestCase):
         with patch.object(first, "chat", return_value=ChatResponse("one", "first", provider="first")), patch.object(second, "chat", return_value=ChatResponse("two", "second", provider="second")):
             response = router.route(ChatRequest.from_dict({"task": "chat", "messages": [{"role": "user", "content": "hi"}]}))
         self.assertEqual(response.provider, "second")
+
+    def test_unprobed_provider_is_unknown(self) -> None:
+        router = Router(self.config())
+        self.assertEqual(router.health()[0]["status"], "unknown")
+        self.assertFalse(router.health()[0]["healthy"])
+
+    def test_default_model_selects_named_provider(self) -> None:
+        config = GatewayConfig(
+            ServerConfig(),
+            RoutingConfig(max_retries=0, default_model="two"),
+            self.config().providers,
+        )
+        router = Router(config)
+        with patch.object(router.states["second"].provider, "chat", return_value=ChatResponse("two", "default", provider="second")):
+            response = router.route(ChatRequest.from_dict({"messages": [{"role": "user", "content": "hi"}]}))
+        self.assertEqual(response.provider, "second")

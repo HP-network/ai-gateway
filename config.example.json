@@ -3,6 +3,9 @@
     "host": "0.0.0.0",
     "port": 8080,
     "api_key_env": "AI_GATEWAY_API_KEY",
+    "admin_api_key_env": "AI_GATEWAY_ADMIN_API_KEY",
+    "database_path": "ai-gateway.db",
+    "rate_limit_per_minute": 120,
     "request_timeout_seconds": 45
   },
   "routing": {

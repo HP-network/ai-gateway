@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,7 @@ class ConfigError(ValueError):
 
 
 def _number(value: Any, name: str, *, minimum: float = 0) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < minimum:
         raise ConfigError(f"{name} must be a number >= {minimum}")
     return float(value)
 
@@ -43,10 +44,13 @@ def load_config(path: str | Path) -> GatewayConfig:
         raise ConfigError("providers must be a non-empty array")
 
     server = ServerConfig(
-        host=str(server_raw.get("host", "0.0.0.0")),
+        host=_text(server_raw.get("host", "0.0.0.0"), "server.host"),
         port=_integer(server_raw.get("port", 8080), "server.port", minimum=1),
         api_key=_secret(server_raw.get("api_key"), server_raw.get("api_key_env")),
         request_timeout_seconds=_number(server_raw.get("request_timeout_seconds", 45), "server.request_timeout_seconds", minimum=0.1),
+        admin_api_key=_secret(server_raw.get("admin_api_key"), server_raw.get("admin_api_key_env")),
+        database_path=_text(server_raw.get("database_path", "ai-gateway.db"), "server.database_path"),
+        rate_limit_per_minute=_integer(server_raw.get("rate_limit_per_minute", 0), "server.rate_limit_per_minute"),
     )
     if not 1 <= server.port <= 65535:
         raise ConfigError("server.port must be between 1 and 65535")
@@ -79,6 +83,8 @@ def load_config(path: str | Path) -> GatewayConfig:
         model = item.get("model")
         if not all(isinstance(value, str) and value.strip() for value in (name, kind, base_url, model)):
             raise ConfigError("provider name, kind, base_url, and model are required")
+        if kind not in {"openai", "openai-compatible", "anthropic", "gemini", "ollama"}:
+            raise ConfigError(f"unsupported provider kind: {kind}")
         if name in names:
             raise ConfigError(f"duplicate provider name: {name}")
         names.add(name)
@@ -159,9 +165,12 @@ def config_from_env() -> GatewayConfig:
         raise ConfigError("AI_GATEWAY_PORT must be between 1 and 65535")
     return GatewayConfig(
         server=ServerConfig(
-            host=os.environ.get("AI_GATEWAY_HOST", "127.0.0.1"),
+            host=_text(os.environ.get("AI_GATEWAY_HOST", "127.0.0.1"), "AI_GATEWAY_HOST"),
             port=port,
             api_key=os.environ.get("AI_GATEWAY_API_KEY") or None,
+            admin_api_key=os.environ.get("AI_GATEWAY_ADMIN_API_KEY") or None,
+            database_path=_text(os.environ.get("AI_GATEWAY_DATABASE", "ai-gateway.db"), "AI_GATEWAY_DATABASE"),
+            rate_limit_per_minute=_env_integer("AI_GATEWAY_RATE_LIMIT", 0),
             request_timeout_seconds=_env_number("AI_GATEWAY_TIMEOUT", 45.0, minimum=0.1),
         ),
         routing=RoutingConfig(
@@ -223,6 +232,12 @@ def _headers(value: Any, provider_name: str) -> dict[str, str]:
     if not isinstance(value, dict):
         raise ConfigError(f"provider {provider_name} headers must be an object")
     return {str(key): str(item) for key, item in value.items()}
+
+
+def _text(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{name} must be a non-empty string")
+    return value.strip()
 
 
 def _secret(value: Any, env_name: Any) -> str | None:

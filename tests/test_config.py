@@ -53,3 +53,22 @@ class ConfigTests(unittest.TestCase):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "should-not-be-used"}, clear=True):
             config = load_config_or_env(path)
         self.assertEqual([provider.name for provider in config.providers], ["local"])
+
+    def test_parses_admin_storage_and_rate_limit_settings(self) -> None:
+        path = self.write({
+            "server": {
+                "admin_api_key": "admin",
+                "database_path": "/tmp/gateway.db",
+                "rate_limit_per_minute": 12,
+            },
+            "providers": [{"name": "local", "kind": "ollama", "base_url": "http://localhost", "model": "llama"}],
+        })
+        config = load_config(path)
+        self.assertEqual(config.server.admin_api_key, "admin")
+        self.assertEqual(config.server.database_path, "/tmp/gateway.db")
+        self.assertEqual(config.server.rate_limit_per_minute, 12)
+
+    def test_rejects_unknown_provider_kind(self) -> None:
+        path = self.write({"providers": [{"name": "bad", "kind": "unknown", "base_url": "http://localhost", "model": "x"}]})
+        with self.assertRaises(ConfigError):
+            load_config(path)

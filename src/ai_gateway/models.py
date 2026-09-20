@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
+import uuid
 from typing import Any
 
 
@@ -54,7 +56,7 @@ class ChatRequest:
             raise RequestValidationError("model must be a non-empty string")
         temperature = value.get("temperature")
         if temperature is not None:
-            if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2:
+            if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not math.isfinite(temperature) or not 0 <= temperature <= 2:
                 raise RequestValidationError("temperature must be between 0 and 2")
             temperature = float(temperature)
         max_tokens = value.get("max_tokens")
@@ -84,9 +86,10 @@ class Usage:
     def from_dict(cls, value: Any) -> "Usage":
         if not isinstance(value, dict):
             return cls()
-        prompt = int(value.get("prompt_tokens", value.get("input_tokens", 0)) or 0)
-        completion = int(value.get("completion_tokens", value.get("output_tokens", 0)) or 0)
-        total = int(value.get("total_tokens", prompt + completion) or 0)
+        prompt = _usage_int(value.get("prompt_tokens", value.get("input_tokens", value.get("promptTokenCount", 0))))
+        completion = _usage_int(value.get("completion_tokens", value.get("output_tokens", value.get("candidatesTokenCount", 0))))
+        total_value = value.get("total_tokens", value.get("totalTokenCount"))
+        total = _usage_int(total_value) if total_value is not None else prompt + completion
         return cls(prompt, completion, total)
 
     def as_dict(self) -> dict[str, int]:
@@ -95,6 +98,14 @@ class Usage:
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
         }
+
+
+def _usage_int(value: Any) -> int:
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, parsed)
 
 
 @dataclass(frozen=True)
@@ -109,7 +120,7 @@ class ChatResponse:
         import time
 
         return {
-            "id": f"chatcmpl-{int(time.time() * 1000)}",
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": request_model or self.model,
@@ -141,6 +152,9 @@ class ServerConfig:
     port: int = 8080
     api_key: str | None = None
     request_timeout_seconds: float = 45.0
+    admin_api_key: str | None = None
+    database_path: str = "ai-gateway.db"
+    rate_limit_per_minute: int = 0
 
 
 @dataclass(frozen=True)

@@ -64,7 +64,7 @@ class OpenAICompatibleProvider(JsonHttpProvider):
             message = choice["message"]
             content = message.get("content", "")
             if not isinstance(content, str):
-                content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+                content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict) and part.get("text") is not None)
             return ChatResponse(self.config.model, content, choice.get("finish_reason") or "stop", Usage.from_dict(response.get("usage")), self.config.name)
         except (KeyError, IndexError, TypeError) as exc:
             raise ProviderError(f"{self.config.name} returned an invalid chat response") from exc
@@ -88,7 +88,7 @@ class AnthropicProvider(JsonHttpProvider):
         payload.update(request.extra)
         response = self._request(f"{self.config.base_url}/v1/messages", payload, headers)
         try:
-            content = "".join(part.get("text", "") for part in response["content"] if isinstance(part, dict))
+            content = "".join(str(part.get("text", "")) for part in response["content"] if isinstance(part, dict) and part.get("text") is not None)
             return ChatResponse(self.config.model, content, response.get("stop_reason") or "stop", Usage.from_dict(response.get("usage")), self.config.name)
         except (KeyError, TypeError) as exc:
             raise ProviderError(f"{self.config.name} returned an invalid messages response") from exc

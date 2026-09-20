@@ -6,6 +6,9 @@ services:
     environment:
       AI_GATEWAY_HOST: ${AI_GATEWAY_HOST:-0.0.0.0}
       AI_GATEWAY_API_KEY: ${AI_GATEWAY_API_KEY:-}
+      AI_GATEWAY_ADMIN_API_KEY: ${AI_GATEWAY_ADMIN_API_KEY:-}
+      AI_GATEWAY_DATABASE: ${AI_GATEWAY_DATABASE:-/data/ai-gateway.db}
+      AI_GATEWAY_RATE_LIMIT: ${AI_GATEWAY_RATE_LIMIT:-120}
       AI_GATEWAY_TIMEOUT: ${AI_GATEWAY_TIMEOUT:-45}
       AI_GATEWAY_MAX_RETRIES: ${AI_GATEWAY_MAX_RETRIES:-2}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -19,3 +22,13 @@ services:
       GEMINI_BASE_URL: ${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+    volumes:
+      - ai-gateway-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  ai-gateway-data:
