@@ -25,6 +25,6 @@ ENV AI_GATEWAY_HOST=0.0.0.0 \
 
 EXPOSE 8080
 VOLUME ["/data"]
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD curl --fail --silent http://127.0.0.1:8080/ || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD curl --fail --silent http://127.0.0.1:8080/live || exit 1
 
 ENTRYPOINT ["/usr/local/bin/ai-gateway"]

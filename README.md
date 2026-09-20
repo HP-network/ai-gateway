@@ -184,6 +184,8 @@ AI_GATEWAY_UPSTREAM_OUTPUT_PRICE=0.60
 | `POST` | `/v1/chat/completions` | OpenAI-compatible 对话和流式输出 |
 | `GET` | `/v1/models` | 已配置模型 |
 | `GET` | `/health` | provider 状态和并发槽位 |
+| `GET` | `/live` | 无鉴权存活探针 |
+| `GET` | `/ready` | provider 就绪探针 |
 | `GET` | `/metrics` | Prometheus 指标 |
 | `GET` | `/dashboard` | 浏览器运营面板 |
 | `GET` | `/admin/stats` | 聚合用量 |

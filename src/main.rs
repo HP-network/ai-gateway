@@ -31,7 +31,7 @@ use tokio::{
 use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
 use tracing::{error, info};
 
-const VERSION: &str = "0.7.0";
+const VERSION: &str = "0.8.0";
 const MAX_BODY_BYTES: usize = 2_000_000;
 
 #[derive(Clone)]
@@ -1145,10 +1145,24 @@ impl StreamNormalizer {
             return Vec::new();
         }
         self.finished = true;
-        vec![
-            stream_chunk(&self.id, self.created, &self.model, None, "", Some(reason)),
-            stream_done(),
-        ]
+        let mut frames = vec![stream_chunk(
+            &self.id,
+            self.created,
+            &self.model,
+            None,
+            "",
+            Some(reason),
+        )];
+        if self.usage.total_tokens > 0 {
+            frames.push(stream_usage_chunk(
+                &self.id,
+                self.created,
+                &self.model,
+                &self.usage,
+            ));
+        }
+        frames.push(stream_done());
+        frames
     }
 
     fn finish(&mut self) -> Vec<Bytes> {
@@ -1185,6 +1199,18 @@ fn stream_chunk(
 
 fn stream_done() -> Bytes {
     Bytes::from_static(b"data: [DONE]\n\n")
+}
+
+fn stream_usage_chunk(id: &str, created: i64, model: &str, usage: &Usage) -> Bytes {
+    let value = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [],
+        "usage": usage.json()
+    });
+    Bytes::from(format!("data: {value}\n\n"))
 }
 
 fn normalize_response(provider: &ProviderConfig, body: Value) -> Result<ChatResponse> {
@@ -1924,6 +1950,37 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
     }
 }
 
+async fn live() -> Json<Value> {
+    Json(json!({"status": "ok", "version": VERSION}))
+}
+
+async fn ready(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !matches!(api_allowed(&state, &headers, true), Ok(Some(_))) {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid API key",
+            "authentication_error",
+        );
+    }
+    let providers = state.router.health();
+    let ready = providers
+        .iter()
+        .any(|provider| provider.status != "unavailable");
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({
+            "status": if ready { "ready" } else { "unavailable" },
+            "providers": providers
+        })),
+    )
+        .into_response()
+}
+
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     match api_allowed(&state, &headers, true) {
         Ok(Some(_)) => (
@@ -2350,6 +2407,8 @@ fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/dashboard", get(dashboard))
+        .route("/live", get(live))
+        .route("/ready", get(ready))
         .route("/health", get(health))
         .route("/v1/health", get(health))
         .route("/v1/models", get(models))
@@ -3046,8 +3105,8 @@ mod tests {
         assert!(frame.contains("hello"));
         let final_frames =
             normalizer.process_line(r#"{"message":{"content":""},"done":true,"eval_count":2}"#);
-        assert_eq!(final_frames.len(), 2);
-        assert!(String::from_utf8(final_frames[1].to_vec())
+        assert_eq!(final_frames.len(), 3);
+        assert!(String::from_utf8(final_frames[2].to_vec())
             .unwrap()
             .contains("[DONE]"));
     }
@@ -3097,13 +3156,16 @@ mod tests {
         normalizer.process_line(
             r#"data: {"type":"message_start","message":{"usage":{"input_tokens":11}},"usage":{"input_tokens":11}}"#,
         );
-        normalizer.process_line(
+        let final_frames = normalizer.process_line(
             r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
         );
         let usage = normalizer.usage();
         assert_eq!(usage.prompt_tokens, 11);
         assert_eq!(usage.completion_tokens, 7);
         assert_eq!(usage.total_tokens, 18);
+        assert!(String::from_utf8(final_frames[1].to_vec())
+            .unwrap()
+            .contains("total_tokens"));
     }
 
     #[test]

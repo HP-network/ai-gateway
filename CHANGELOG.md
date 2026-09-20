@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.0
+
+- Added OpenAI-compatible usage chunks to normalized non-OpenAI streams.
+- Added unauthenticated `/live` and authenticated `/ready` probes for deployment health checks.
+- Switched Docker and Compose healthchecks to `/live`.
+
 ## 0.7.0
 
 - Added durable per-request audit records with request IDs, provider, model, status, latency, token usage, error details, and estimated cost.
