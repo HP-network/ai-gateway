@@ -65,7 +65,7 @@ class GatewayService:
 
 def make_handler(service: GatewayService) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
-        server_version = "ai-gateway/0.1.2"
+        server_version = "ai-gateway/0.1.3"
 
         def do_GET(self) -> None:  # noqa: N802
             if self.path != "/" and not service.authenticate(self._api_key()):
