@@ -124,6 +124,8 @@ Any OpenAI-compatible vendor can be added with `OPENAI_BASE_URL`, or declared ex
 - **Streaming**: provider-native streams are forwarded or normalized to one OpenAI-compatible SSE contract.
 - **Routing**: select a model, provider name, or task route; priorities define the normal order.
 - **Failover**: bounded retries and a cooldown for providers that repeatedly fail.
+- **Concurrency control**: per-provider semaphores prevent one upstream from being flooded.
+- **Model aliases**: expose stable names such as `fast` or `local` while changing the backing model in config.
 - **Access control**: optional gateway/admin bearer keys plus hashed, revocable client keys.
 - **Usage accounting**: durable SQLite totals for requests, failures, latency, and tokens.
 - **Rate limits**: sliding-window limits per master or managed client key.
@@ -160,10 +162,10 @@ Create a managed key. The plaintext token is returned once and is never stored o
 curl -X POST http://127.0.0.1:8080/admin/api-keys \
   -H 'authorization: Bearer admin-secret' \
   -H 'content-type: application/json' \
-  -d '{"name":"my-app"}'
+  -d '{"name":"my-app","request_limit":10000,"token_limit":5000000}'
 ```
 
-Use the returned `ag_...` token in the client application:
+Limits are optional. When set, the gateway rejects requests after the request or token budget is exhausted and exposes the current limits in `/admin/api-keys` and the dashboard. Use the returned `ag_...` token in the client application:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -200,6 +202,8 @@ ai-gateway --config config.json
 ```
 
 Secrets can be referenced with `api_key_env` instead of putting them in JSON. The service rejects ambiguous or invalid configuration before it binds a port.
+
+Each file provider accepts `max_concurrency`; `routing.model_aliases` maps a client-facing model name to a configured provider model.
 
 ## API Surface
 

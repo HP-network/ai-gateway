@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0
+
+- Added atomic per-key request and token quota reservations with SQLite-compatible migration for existing databases.
+- Added optional request and token limits to managed key creation and the operations dashboard.
+- Added per-provider concurrency gates and live available-slot health reporting.
+- Added model aliases with startup validation so clients can use stable names while providers change.
+
 ## 0.4.1
 
 - Fixed a Clippy warning on the streaming SSE formatter so the release pipeline stays warning-free.

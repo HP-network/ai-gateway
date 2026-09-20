@@ -24,11 +24,14 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::net::TcpListener;
+use tokio::{
+    net::TcpListener,
+    sync::{OwnedSemaphorePermit, Semaphore},
+};
 use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
 use tracing::{error, info};
 
-const VERSION: &str = "0.4.1";
+const VERSION: &str = "0.5.0";
 const MAX_BODY_BYTES: usize = 2_000_000;
 
 #[derive(Clone)]
@@ -65,6 +68,7 @@ struct RoutingConfig {
     max_retries: usize,
     failure_cooldown_seconds: f64,
     task_routes: HashMap<String, Vec<String>>,
+    model_aliases: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +80,7 @@ struct ProviderConfig {
     api_key: Option<String>,
     timeout_seconds: f64,
     priority: i64,
+    max_concurrency: usize,
     headers: HashMap<String, String>,
 }
 
@@ -172,6 +177,7 @@ struct RouterState {
 
 struct ProviderRuntime {
     config: ProviderConfig,
+    semaphore: Arc<Semaphore>,
     failures: u32,
     unavailable_until: Option<Instant>,
     requests: u64,
@@ -190,6 +196,8 @@ struct ProviderHealth {
     requests: u64,
     errors: u64,
     average_latency_ms: f64,
+    max_concurrency: usize,
+    available_concurrency: usize,
 }
 
 impl RouterState {
@@ -199,8 +207,10 @@ impl RouterState {
             .iter()
             .cloned()
             .map(|config| {
+                let max_concurrency = config.max_concurrency;
                 Mutex::new(ProviderRuntime {
                     config,
+                    semaphore: Arc::new(Semaphore::new(max_concurrency)),
                     failures: 0,
                     unavailable_until: None,
                     requests: 0,
@@ -232,8 +242,18 @@ impl RouterState {
                 runtime.requests += 1;
                 (runtime.config.clone(), Instant::now())
             };
+            let semaphore = self.providers[index]
+                .lock()
+                .expect("provider state poisoned")
+                .semaphore
+                .clone();
+            let permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow!("provider concurrency gate closed"))?;
             match provider_chat(client, &provider, request).await {
                 Ok(response) => {
+                    drop(permit);
                     let mut runtime = self.providers[index]
                         .lock()
                         .expect("provider state poisoned");
@@ -267,7 +287,7 @@ impl RouterState {
         &self,
         client: &Client,
         request: &ChatRequest,
-    ) -> Result<(ProviderConfig, reqwest::Response)> {
+    ) -> Result<(ProviderConfig, reqwest::Response, OwnedSemaphorePermit)> {
         let candidates = self.candidates(request);
         if candidates.is_empty() {
             return Err(anyhow!("no healthy provider matches this request"));
@@ -284,6 +304,15 @@ impl RouterState {
                 runtime.requests += 1;
                 (runtime.config.clone(), Instant::now())
             };
+            let semaphore = self.providers[index]
+                .lock()
+                .expect("provider state poisoned")
+                .semaphore
+                .clone();
+            let permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow!("provider concurrency gate closed"))?;
             match provider_stream(client, &provider, request).await {
                 Ok(response) => {
                     let mut runtime = self.providers[index]
@@ -292,7 +321,7 @@ impl RouterState {
                     runtime.failures = 0;
                     runtime.unavailable_until = None;
                     runtime.latency_total += started.elapsed();
-                    return Ok((provider, response));
+                    return Ok((provider, response, permit));
                 }
                 Err(error) => {
                     let elapsed = started.elapsed();
@@ -331,6 +360,13 @@ impl RouterState {
                     Some(self.routing.default_model.as_str())
                 }
             });
+        let requested_model = requested_model.and_then(|model| {
+            self.routing
+                .model_aliases
+                .get(model)
+                .map(String::as_str)
+                .or(Some(model))
+        });
         let mut indices: Vec<usize> = (0..self.providers.len())
             .filter(|index| {
                 let runtime = self.providers[*index]
@@ -409,6 +445,8 @@ impl RouterState {
                     } else {
                         runtime.latency_total.as_secs_f64() * 1000.0 / runtime.requests as f64
                     },
+                    max_concurrency: runtime.config.max_concurrency,
+                    available_concurrency: runtime.semaphore.available_permits(),
                 }
             })
             .collect()
@@ -636,6 +674,10 @@ fn provider_request(
                 serde_json::to_value(&request.messages)?,
             );
             body.insert("stream".to_owned(), Value::Bool(stream));
+            if stream {
+                body.entry("stream_options".to_owned())
+                    .or_insert_with(|| json!({"include_usage": true}));
+            }
             if let Some(value) = request.temperature {
                 body.insert("temperature".to_owned(), json!(value));
             }
@@ -761,16 +803,17 @@ fn provider_stream_body(
     response: reqwest::Response,
     provider: &ProviderConfig,
     model: String,
+    permit: OwnedSemaphorePermit,
 ) -> ByteStream {
     if matches!(provider.kind.as_str(), "openai" | "openai-compatible") {
-        return Box::pin(
-            response
-                .bytes_stream()
-                .map(|chunk| chunk.map_err(|error| io::Error::other(error.to_string()))),
-        );
+        return Box::pin(response.bytes_stream().map(move |chunk| {
+            let _permit = &permit;
+            chunk.map_err(|error| io::Error::other(error.to_string()))
+        }));
     }
     let kind = provider.kind.clone();
     let stream = try_stream! {
+        let _permit = permit;
         let mut source = response.bytes_stream();
         let mut buffer = String::new();
         let mut normalizer = StreamNormalizer::new(kind, model);
@@ -1094,6 +1137,8 @@ struct ApiKey {
     revoked_at: Option<i64>,
     requests: i64,
     tokens: i64,
+    request_limit: Option<i64>,
+    token_limit: Option<i64>,
 }
 
 struct Store {
@@ -1123,7 +1168,9 @@ impl Store {
                 last_used_at INTEGER,
                 revoked_at INTEGER,
                 requests INTEGER NOT NULL DEFAULT 0,
-                tokens INTEGER NOT NULL DEFAULT 0
+                tokens INTEGER NOT NULL DEFAULT 0,
+                request_limit INTEGER,
+                token_limit INTEGER
             );
             CREATE TABLE IF NOT EXISTS usage (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1137,6 +1184,19 @@ impl Store {
             );
             INSERT OR IGNORE INTO usage (id) VALUES (1);",
         )?;
+        for column in ["request_limit", "token_limit"] {
+            let exists: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('api_keys') WHERE name = ?",
+                [column],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                connection.execute(
+                    &format!("ALTER TABLE api_keys ADD COLUMN {column} INTEGER"),
+                    [],
+                )?;
+            }
+        }
         Ok(Self { connection })
     }
 
@@ -1148,7 +1208,12 @@ impl Store {
             })?)
     }
 
-    fn create_key(&mut self, name: &str) -> Result<(String, ApiKey)> {
+    fn create_key(
+        &mut self,
+        name: &str,
+        request_limit: Option<i64>,
+        token_limit: Option<i64>,
+    ) -> Result<(String, ApiKey)> {
         let name = if name.trim().is_empty() {
             "default"
         } else {
@@ -1157,11 +1222,25 @@ impl Store {
         if name.len() > 100 {
             return Err(anyhow!("key name must be 100 characters or fewer"));
         }
+        if request_limit.is_some_and(|limit| limit < 1)
+            || token_limit.is_some_and(|limit| limit < 1)
+        {
+            return Err(anyhow!("key limits must be positive when set"));
+        }
         let token = format!("ag_{}", uuid::Uuid::new_v4().simple());
         let now = unix_now();
         self.connection.execute(
-            "INSERT INTO api_keys (name, prefix, digest, created_at) VALUES (?, ?, ?, ?)",
-            params![name, &token[..11], digest(&token), now],
+            "INSERT INTO api_keys
+             (name, prefix, digest, created_at, request_limit, token_limit)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                name,
+                &token[..11],
+                digest(&token),
+                now,
+                request_limit,
+                token_limit
+            ],
         )?;
         let id = self.connection.last_insert_rowid();
         Ok((
@@ -1175,7 +1254,8 @@ impl Store {
         Ok(self
             .connection
             .query_row(
-                "SELECT id,name,prefix,created_at,last_used_at,revoked_at,requests,tokens
+                "SELECT id,name,prefix,created_at,last_used_at,revoked_at,requests,tokens,
+                        request_limit,token_limit
                  FROM api_keys WHERE digest = ? AND revoked_at IS NULL",
                 [digest],
                 row_to_key,
@@ -1183,13 +1263,14 @@ impl Store {
             .optional()?)
     }
 
-    fn touch(&mut self, id: i64) -> Result<()> {
-        self.connection.execute(
+    fn reserve(&mut self, id: i64) -> Result<bool> {
+        Ok(self.connection.execute(
             "UPDATE api_keys SET last_used_at = ?, requests = requests + 1
-             WHERE id = ? AND revoked_at IS NULL",
+             WHERE id = ? AND revoked_at IS NULL
+               AND (request_limit IS NULL OR requests < request_limit)
+               AND (token_limit IS NULL OR tokens < token_limit)",
             params![unix_now(), id],
-        )?;
-        Ok(())
+        )? == 1)
     }
 
     fn revoke(&mut self, id: i64) -> Result<bool> {
@@ -1201,7 +1282,8 @@ impl Store {
 
     fn list_keys(&self) -> Result<Vec<ApiKey>> {
         let mut statement = self.connection.prepare(
-            "SELECT id,name,prefix,created_at,last_used_at,revoked_at,requests,tokens
+            "SELECT id,name,prefix,created_at,last_used_at,revoked_at,requests,tokens,
+                    request_limit,token_limit
              FROM api_keys ORDER BY created_at DESC",
         )?;
         let keys = statement
@@ -1286,7 +1368,8 @@ impl Store {
         Ok(self
             .connection
             .query_row(
-                "SELECT id,name,prefix,created_at,last_used_at,revoked_at,requests,tokens
+                "SELECT id,name,prefix,created_at,last_used_at,revoked_at,requests,tokens,
+                        request_limit,token_limit
                  FROM api_keys WHERE id=?",
                 [id],
                 row_to_key,
@@ -1305,6 +1388,8 @@ fn row_to_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiKey> {
         revoked_at: row.get(5)?,
         requests: row.get(6)?,
         tokens: row.get(7)?,
+        request_limit: row.get(8)?,
+        token_limit: row.get(9)?,
     })
 }
 
@@ -1324,6 +1409,8 @@ fn unix_now() -> i64 {
 #[derive(Deserialize)]
 struct CreateKeyRequest {
     name: String,
+    request_limit: Option<i64>,
+    token_limit: Option<i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -1577,11 +1664,21 @@ async fn chat(
         _ => None,
     };
     if let Some(id) = key_id {
-        if let Err(error) = state.store.lock().expect("store poisoned").touch(id) {
+        let reserved = match state.store.lock().expect("store poisoned").reserve(id) {
+            Ok(value) => value,
+            Err(error) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error.to_string(),
+                    "internal_error",
+                )
+            }
+        };
+        if !reserved {
             return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error.to_string(),
-                "internal_error",
+                StatusCode::TOO_MANY_REQUESTS,
+                "managed API key quota exceeded",
+                "quota_exceeded",
             );
         }
     }
@@ -1634,7 +1731,7 @@ async fn chat(
 async fn stream_chat(state: AppState, request: ChatRequest, key_id: Option<i64>) -> Response {
     let started = Instant::now();
     match state.router.route_stream(&state.client, &request).await {
-        Ok((provider, response)) => {
+        Ok((provider, response, permit)) => {
             let elapsed = started.elapsed();
             state
                 .metrics
@@ -1650,7 +1747,7 @@ async fn stream_chat(state: AppState, request: ChatRequest, key_id: Option<i64>)
                 error!(%error, "failed to persist streaming usage");
             }
             let model = request.model.clone().unwrap_or(provider.model.clone());
-            let stream = provider_stream_body(response, &provider, model);
+            let stream = provider_stream_body(response, &provider, model, permit);
             (
                 StatusCode::OK,
                 [
@@ -1745,12 +1842,11 @@ async fn create_key(
             "authentication_error",
         );
     }
-    match state
-        .store
-        .lock()
-        .expect("store poisoned")
-        .create_key(&body.name)
-    {
+    match state.store.lock().expect("store poisoned").create_key(
+        &body.name,
+        body.request_limit,
+        body.token_limit,
+    ) {
         Ok((token, key)) => (
             StatusCode::CREATED,
             Json(json!({"key": token, "data": key})),
@@ -1896,6 +1992,8 @@ struct RawRouting {
     failure_cooldown_seconds: Option<f64>,
     #[serde(default)]
     task_routes: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    model_aliases: HashMap<String, String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -1908,6 +2006,7 @@ struct RawProvider {
     api_key_env: Option<String>,
     timeout_seconds: Option<f64>,
     priority: Option<i64>,
+    max_concurrency: Option<usize>,
     headers: Option<HashMap<String, String>>,
 }
 
@@ -1970,8 +2069,10 @@ fn parse_file_config(path: &FsPath) -> Result<Config> {
             "routing.failure_cooldown_seconds",
         )?,
         task_routes: routing_raw.task_routes,
+        model_aliases: routing_raw.model_aliases,
     };
     validate_routes(&routing.task_routes, &providers)?;
+    validate_aliases(&routing.model_aliases, &providers)?;
     Ok(Config {
         server,
         routing,
@@ -1994,6 +2095,7 @@ fn env_config() -> Result<Config> {
             api_key: Some(key),
             timeout_seconds: 45.0,
             priority: 30,
+            max_concurrency: 64,
             headers: HashMap::new(),
         });
     }
@@ -2011,6 +2113,7 @@ fn env_config() -> Result<Config> {
             api_key: Some(key),
             timeout_seconds: 45.0,
             priority: 20,
+            max_concurrency: 32,
             headers: HashMap::new(),
         });
     }
@@ -2027,6 +2130,7 @@ fn env_config() -> Result<Config> {
             api_key: Some(key),
             timeout_seconds: 45.0,
             priority: 20,
+            max_concurrency: 32,
             headers: HashMap::new(),
         });
     }
@@ -2043,6 +2147,7 @@ fn env_config() -> Result<Config> {
             api_key: None,
             timeout_seconds: 45.0,
             priority: 10,
+            max_concurrency: 8,
             headers: HashMap::new(),
         });
     }
@@ -2089,6 +2194,7 @@ fn env_config() -> Result<Config> {
                 .transpose()?
                 .unwrap_or(30.0),
             task_routes: HashMap::new(),
+            model_aliases: HashMap::new(),
         },
         providers,
     })
@@ -2131,6 +2237,7 @@ fn provider_from_raw(raw: RawProvider, default_timeout: f64) -> Result<ProviderC
             "provider.timeout_seconds",
         )?,
         priority: raw.priority.unwrap_or(0),
+        max_concurrency: raw.max_concurrency.unwrap_or(16).max(1),
         headers: raw.headers.unwrap_or_default(),
     })
 }
@@ -2148,6 +2255,25 @@ fn validate_routes(
             if !names.contains(&name.as_str()) {
                 return Err(anyhow!("task route references unknown provider: {name}"));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_aliases(aliases: &HashMap<String, String>, providers: &[ProviderConfig]) -> Result<()> {
+    for (alias, target) in aliases {
+        if alias.trim().is_empty() || target.trim().is_empty() {
+            return Err(anyhow!(
+                "model aliases must have non-empty names and targets"
+            ));
+        }
+        if !providers
+            .iter()
+            .any(|provider| provider.name == *target || provider.model == *target)
+        {
+            return Err(anyhow!(
+                "model alias '{alias}' references unknown model or provider: {target}"
+            ));
         }
     }
     Ok(())
@@ -2263,6 +2389,7 @@ mod tests {
             api_key: None,
             timeout_seconds: 1.0,
             priority,
+            max_concurrency: 2,
             headers: HashMap::new(),
         }
     }
@@ -2331,6 +2458,16 @@ mod tests {
     }
 
     #[test]
+    fn managed_key_limits_survive_creation_and_usage() {
+        let mut store = Store::open(":memory:").unwrap();
+        let (_, key) = store.create_key("limited", Some(1), Some(10)).unwrap();
+        assert_eq!(key.request_limit, Some(1));
+        assert_eq!(key.token_limit, Some(10));
+        assert!(store.reserve(key.id).unwrap());
+        assert!(!store.reserve(key.id).unwrap());
+    }
+
+    #[test]
     fn usage_normalizes_provider_field_names() {
         let usage = Usage::from_value(Some(&json!({
             "promptTokenCount": 4,
@@ -2359,6 +2496,7 @@ mod tests {
                 max_retries: 1,
                 failure_cooldown_seconds: 1.0,
                 task_routes: HashMap::new(),
+                model_aliases: HashMap::new(),
             },
             providers: vec![provider("first", "one", 20), provider("second", "two", 10)],
         };
@@ -2368,6 +2506,46 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(router.candidates(&request), vec![1]);
+    }
+
+    #[test]
+    fn router_resolves_model_aliases_before_matching() {
+        let config = Config {
+            server: ServerConfig {
+                host: "127.0.0.1".to_owned(),
+                port: 8080,
+                api_key: None,
+                admin_api_key: None,
+                database_path: ":memory:".to_owned(),
+                rate_limit_per_minute: 0,
+                request_timeout_seconds: 1.0,
+            },
+            routing: RoutingConfig {
+                default_model: "auto".to_owned(),
+                max_retries: 1,
+                failure_cooldown_seconds: 1.0,
+                task_routes: HashMap::new(),
+                model_aliases: HashMap::from([("fast".to_owned(), "one".to_owned())]),
+            },
+            providers: vec![provider("first", "one", 20), provider("second", "two", 10)],
+        };
+        let router = RouterState::new(&config);
+        let request = ChatRequest::parse(json!({
+            "model": "fast",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        assert_eq!(router.candidates(&request), vec![0]);
+    }
+
+    #[test]
+    fn rejects_aliases_that_do_not_match_a_provider() {
+        let providers = vec![provider("openai", "gpt", 1)];
+        assert!(validate_aliases(
+            &HashMap::from([("fast".to_owned(), "missing".to_owned())]),
+            &providers
+        )
+        .is_err());
     }
 
     #[test]
