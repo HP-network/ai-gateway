@@ -31,7 +31,7 @@ use tokio::{
 use tower_http::{catch_panic::CatchPanicLayer, trace::TraceLayer};
 use tracing::{error, info};
 
-const VERSION: &str = "0.5.0";
+const VERSION: &str = "0.6.0";
 const MAX_BODY_BYTES: usize = 2_000_000;
 
 #[derive(Clone)]
@@ -1917,12 +1917,16 @@ async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "ai-gateway {VERSION}\n\nUsage:\n  ai-gateway [--config <path>]\n  ai-gateway check-config [--config <path>]\n  ai-gateway --version\n  ai-gateway --help\n\nEnvironment mode discovers providers from OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, and OLLAMA_MODEL."
+            "ai-gateway {VERSION}\n\nUsage:\n  ai-gateway [--config <path>]\n  ai-gateway init\n  ai-gateway check-config [--config <path>]\n  ai-gateway --version\n  ai-gateway --help\n\nQuick start:\n  ai-gateway init              create a starter .env file\n  ai-gateway check-config      validate providers before binding a port\n  ai-gateway                   start the gateway\n\nEnvironment mode accepts AI_GATEWAY_UPSTREAM_* for one OpenAI-compatible\nprovider, or auto-discovers OPENAI_*, ANTHROPIC_*, GEMINI_*, and OLLAMA_* settings."
         );
         return Ok(());
     }
     if args.iter().any(|arg| arg == "--version") {
         println!("ai-gateway {VERSION}");
+        return Ok(());
+    }
+    if args.iter().any(|arg| arg == "init") {
+        init_dotenv(FsPath::new(".env"))?;
         return Ok(());
     }
     let config_path = args
@@ -1935,7 +1939,18 @@ async fn main() -> Result<()> {
             "{}",
             json!({
                 "valid": true,
-                "providers": config.providers.iter().map(|provider| provider.name.clone()).collect::<Vec<_>>()
+                "listen": format!("{}:{}", config.server.host, config.server.port),
+                "auth": {
+                    "api_key": config.server.api_key.is_some(),
+                    "admin_api_key": config.server.admin_api_key.is_some()
+                },
+                "providers": config.providers.iter().map(|provider| json!({
+                    "name": provider.name,
+                    "kind": provider.kind,
+                    "model": provider.model,
+                    "base_url": provider.base_url,
+                    "authenticated": provider.api_key.is_some()
+                })).collect::<Vec<_>>()
             })
         );
         return Ok(());
@@ -2082,6 +2097,52 @@ fn parse_file_config(path: &FsPath) -> Result<Config> {
 
 fn env_config() -> Result<Config> {
     let mut providers = Vec::new();
+    let upstream_kind =
+        env_nonempty("AI_GATEWAY_UPSTREAM_KIND").unwrap_or_else(|| "openai-compatible".to_owned());
+    let upstream_key = env_nonempty("AI_GATEWAY_UPSTREAM_API_KEY");
+    let upstream_model = env_nonempty("AI_GATEWAY_UPSTREAM_MODEL");
+    let upstream_configured =
+        upstream_key.is_some() || (upstream_kind == "ollama" && upstream_model.is_some());
+    if upstream_configured {
+        let kind = upstream_kind;
+        if !matches!(
+            kind.as_str(),
+            "openai" | "openai-compatible" | "anthropic" | "gemini" | "ollama"
+        ) {
+            return Err(anyhow!(
+                "AI_GATEWAY_UPSTREAM_KIND must be openai-compatible, anthropic, gemini, or ollama"
+            ));
+        }
+        let base_url = env_nonempty("AI_GATEWAY_UPSTREAM_BASE_URL")
+            .unwrap_or_else(|| default_upstream_base_url(&kind).to_owned())
+            .trim_end_matches('/')
+            .to_owned();
+        let model = upstream_model.unwrap_or_else(|| default_upstream_model(&kind).to_owned());
+        providers.push(ProviderConfig {
+            name: env_nonempty("AI_GATEWAY_UPSTREAM_NAME").unwrap_or_else(|| "upstream".to_owned()),
+            kind,
+            base_url,
+            model,
+            api_key: upstream_key,
+            timeout_seconds: env::var("AI_GATEWAY_UPSTREAM_TIMEOUT")
+                .ok()
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(45.0),
+            priority: env::var("AI_GATEWAY_UPSTREAM_PRIORITY")
+                .ok()
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(40),
+            max_concurrency: env::var("AI_GATEWAY_UPSTREAM_MAX_CONCURRENCY")
+                .ok()
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(32)
+                .max(1),
+            headers: HashMap::new(),
+        });
+    }
     if let Some(key) = env::var("OPENAI_API_KEY")
         .ok()
         .filter(|value| !value.is_empty())
@@ -2240,6 +2301,47 @@ fn provider_from_raw(raw: RawProvider, default_timeout: f64) -> Result<ProviderC
         max_concurrency: raw.max_concurrency.unwrap_or(16).max(1),
         headers: raw.headers.unwrap_or_default(),
     })
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_upstream_base_url(kind: &str) -> &'static str {
+    match kind {
+        "anthropic" => "https://api.anthropic.com",
+        "gemini" => "https://generativelanguage.googleapis.com",
+        "ollama" => "http://127.0.0.1:11434",
+        _ => "https://api.openai.com/v1",
+    }
+}
+
+fn default_upstream_model(kind: &str) -> &'static str {
+    match kind {
+        "anthropic" => "claude-3-5-haiku-latest",
+        "gemini" => "gemini-2.0-flash",
+        "ollama" => "llama3.2",
+        _ => "gpt-4o-mini",
+    }
+}
+
+fn init_dotenv(path: &FsPath) -> Result<()> {
+    if path.exists() {
+        return Err(anyhow!(
+            "{} already exists; edit it instead of overwriting it",
+            path.display()
+        ));
+    }
+    fs::write(path, include_str!("../.env.example"))
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    println!(
+        "Created {}. Put your upstream key in it, then run `ai-gateway check-config`.",
+        path.display()
+    );
+    Ok(())
 }
 
 fn validate_routes(

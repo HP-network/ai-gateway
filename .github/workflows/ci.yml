@@ -20,3 +20,4 @@ jobs:
       - run: cargo test --locked
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo build --release --locked
+      - run: docker build --tag ai-gateway:test .

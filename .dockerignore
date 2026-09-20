@@ -1,0 +1,10 @@
+.git
+.github
+target
+*.db
+*.db-*
+.env
+config.json
+README.md
+CHANGELOG.md
+CONTRIBUTING.md

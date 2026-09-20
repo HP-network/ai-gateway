@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0
+
+- Added a one-provider environment setup for OpenAI-compatible services such as OpenAI, OpenRouter, DeepSeek, and SiliconFlow.
+- Added `ai-gateway init` to create a starter `.env` without overwriting an existing file.
+- Expanded `check-config` output with listen address, authentication state, and provider details.
+- Reworked the README around a copy, configure, and run quick start, with advanced routing kept separate.
+- Added Docker build coverage to CI and a `.dockerignore` for smaller build contexts.
+
 ## 0.5.0
 
 - Added atomic per-key request and token quota reservations with SQLite-compatible migration for existing databases.

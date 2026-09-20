@@ -1,162 +1,136 @@
 # AI Gateway
 
 <p align="center">
-  <strong>One fast, OpenAI-compatible endpoint for multiple LLM providers.</strong><br>
-  Route, fail over, meter, and protect your model traffic from a single Rust binary.
+  <strong>把任何 OpenAI-compatible API 变成一个稳定入口。</strong><br>
+  一个 Rust 二进制，负责路由、故障切换、鉴权、限流和用量统计。
 </p>
 
 <p align="center">
   <a href="https://github.com/HP-network/ai-gateway/actions/workflows/ci.yml"><img src="https://github.com/HP-network/ai-gateway/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/HP-network/ai-gateway/releases"><img src="https://img.shields.io/github/v/release/HP-network/ai-gateway" alt="Release"></a>
   <a href="https://github.com/HP-network/ai-gateway/blob/main/LICENSE"><img src="https://img.shields.io/github/license/HP-network/ai-gateway" alt="License"></a>
-  <img src="https://img.shields.io/badge/runtime-Rust%20%2B%20Tokio-orange" alt="Rust and Tokio">
+  <img src="https://img.shields.io/badge/Rust-1.88%2B-orange" alt="Rust 1.88 or newer">
 </p>
 
-AI Gateway keeps your application pointed at one stable API while providers, models, and credentials change behind it. It is deliberately a gateway, not a hosted billing panel: the process is small, inspectable, Docker-ready, and easy to run beside an existing app.
+## 60 秒启动
 
-## Start Here
-
-Choose one path. You do not need a JSON file for the first two.
-
-### Docker: recommended
+需要 Docker。先复制项目并创建配置：
 
 ```bash
 git clone https://github.com/HP-network/ai-gateway.git
 cd ai-gateway
 cp .env.example .env
-# Put one provider key in .env, then:
+```
+
+打开 `.env`，只填这三项就够了：
+
+```dotenv
+AI_GATEWAY_UPSTREAM_API_KEY=sk-...
+AI_GATEWAY_UPSTREAM_BASE_URL=https://api.openai.com/v1
+AI_GATEWAY_UPSTREAM_MODEL=gpt-4o-mini
+```
+
+启动并检查：
+
+```bash
 docker compose up -d --build
+curl http://127.0.0.1:8080/health
 ```
 
-Check that it is alive:
-
-```bash
-curl http://127.0.0.1:8080/
-```
-
-### Local Rust binary
-
-```bash
-git clone https://github.com/HP-network/ai-gateway.git
-cd ai-gateway
-cp .env.example .env
-# Put OPENAI_API_KEY=sk-... (or another provider) in .env
-cargo run --release
-```
-
-For a reusable command, install it once:
-
-```bash
-cargo install --path .
-ai-gateway
-```
-
-### Local Ollama
-
-```bash
-ollama pull llama3.2
-OLLAMA_MODEL=llama3.2 cargo run --release
-```
-
-The environment mode automatically enables any provider whose key is present. If no cloud key is present, it uses Ollama at `http://127.0.0.1:11434`.
-
-The binary reads a local `.env` file automatically and never overwrites variables already set by the shell. You can still use normal shell exports or a process manager in production.
-
-## Make A Request
-
-The request shape is the OpenAI Chat Completions shape, so existing SDKs only need a new `base_url`.
+发出第一条请求：
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'content-type: application/json' \
-  -d '{
-    "model": "auto",
-    "messages": [{"role": "user", "content": "Give me one useful idea for a Minecraft plugin."}]
-  }'
+  -d '{"model":"auto","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-Streaming uses the same endpoint and the standard OpenAI SSE format:
+客户端只需要把 `base_url` 改成 `http://127.0.0.1:8080/v1`。原来的 OpenAI SDK、LangChain 或 LiteLLM 客户端不用改请求格式。
+
+### 常用上游
+
+| 服务 | `AI_GATEWAY_UPSTREAM_BASE_URL` | 示例模型 |
+| --- | --- | --- |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
+| OpenRouter | `https://openrouter.ai/api/v1` | `openai/gpt-4o-mini` |
+| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` |
+| SiliconFlow | `https://api.siliconflow.cn/v1` | `deepseek-ai/DeepSeek-V3` |
+| 本地 Ollama | `http://host.docker.internal:11434` | `llama3.2` |
+
+把上表中的地址和模型放进 `.env`，不需要写 JSON。
+
+## 不用 Docker
+
+安装 Rust 1.88 或更新版本：
 
 ```bash
-curl --no-buffer http://127.0.0.1:8080/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"auto","stream":true,"messages":[{"role":"user","content":"Stream three short ideas."}]}'
+git clone https://github.com/HP-network/ai-gateway.git
+cd ai-gateway
+cargo run --release -- init
+# 编辑 .env，填入上游 key
+cargo run --release -- check-config
+cargo run --release
 ```
+
+`init` 不会覆盖已有的 `.env`。也可以直接安装二进制：
+
+```bash
+cargo install --path .
+ai-gateway check-config
+ai-gateway
+```
+
+## 接入 SDK
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(
     base_url="http://127.0.0.1:8080/v1",
-    api_key="unused-unless-you-enable-gateway-auth",
+    api_key="unused",  # 设置 AI_GATEWAY_API_KEY 后改成对应值
 )
 
-response = client.chat.completions.create(
+answer = client.chat.completions.create(
     model="auto",
-    messages=[{"role": "user", "content": "hello"}],
+    messages=[{"role": "user", "content": "给我一个实用的插件点子"}],
 )
-print(response.choices[0].message.content)
+print(answer.choices[0].message.content)
 ```
 
-## Providers
-
-| Provider | Enable with | Default model | Adapter |
-| --- | --- | --- | --- |
-| OpenAI or compatible API | `OPENAI_API_KEY` | `gpt-4o-mini` | `/chat/completions` |
-| Anthropic | `ANTHROPIC_API_KEY` | `claude-3-5-haiku-latest` | `/v1/messages` |
-| Gemini | `GEMINI_API_KEY` | `gemini-2.0-flash` | `generateContent` |
-| Ollama | `OLLAMA_MODEL` | `llama3.2` | `/api/chat` |
-
-Change a model or endpoint without changing client code:
+流式请求保持 OpenAI SSE 格式：
 
 ```bash
-OPENAI_MODEL=gpt-4.1-mini \
-OPENAI_BASE_URL=https://api.openai.com/v1 \
-OPENAI_API_KEY=sk-... \
-ai-gateway
+curl --no-buffer http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"auto","stream":true,"messages":[{"role":"user","content":"说三句短句"}]}'
 ```
 
-Any OpenAI-compatible vendor can be added with `OPENAI_BASE_URL`, or declared explicitly in `config.json` when several vendors must coexist.
+## 生产配置
 
-## What You Get
+默认只监听 `127.0.0.1`。如果要让其他机器访问，至少设置应用和管理密钥：
 
-- **Provider abstraction**: OpenAI-compatible, Anthropic, Gemini, and Ollama request/response normalization.
-- **Streaming**: provider-native streams are forwarded or normalized to one OpenAI-compatible SSE contract.
-- **Routing**: select a model, provider name, or task route; priorities define the normal order.
-- **Failover**: bounded retries and a cooldown for providers that repeatedly fail.
-- **Concurrency control**: per-provider semaphores prevent one upstream from being flooded.
-- **Model aliases**: expose stable names such as `fast` or `local` while changing the backing model in config.
-- **Access control**: optional gateway/admin bearer keys plus hashed, revocable client keys.
-- **Usage accounting**: durable SQLite totals for requests, failures, latency, and tokens.
-- **Rate limits**: sliding-window limits per master or managed client key.
-- **Operations**: provider health, Prometheus text metrics, and a browser dashboard at `/dashboard`.
-- **Small runtime**: one async Rust process, rustls HTTPS, and no Python runtime in production.
-
-```mermaid
-flowchart LR
-    App[Your app / OpenAI SDK] --> Gateway[AI Gateway<br/>Axum + Tokio]
-    Gateway --> Route[Model + task routing]
-    Route --> OpenAI[OpenAI-compatible]
-    Route --> Anthropic[Anthropic]
-    Route --> Gemini[Gemini]
-    Route --> Ollama[Ollama]
-    Gateway --> Store[(SQLite usage + keys)]
-    Gateway --> Ops[/health  /metrics  /dashboard]
+```dotenv
+AI_GATEWAY_HOST=0.0.0.0
+AI_GATEWAY_API_KEY=app-secret
+AI_GATEWAY_ADMIN_API_KEY=admin-secret
+AI_GATEWAY_RATE_LIMIT=120
 ```
 
-## Production Setup
-
-Set separate application and admin credentials before exposing the port:
+然后客户端带上：
 
 ```bash
-export OPENAI_API_KEY=sk-...
-export AI_GATEWAY_API_KEY=app-secret
-export AI_GATEWAY_ADMIN_API_KEY=admin-secret
-export AI_GATEWAY_RATE_LIMIT=120
-ai-gateway
+curl http://127.0.0.1:8080/v1/models \
+  -H 'authorization: Bearer app-secret'
 ```
 
-Create a managed key. The plaintext token is returned once and is never stored or shown again:
+管理面板在 `/dashboard`，管理 API 需要 `AI_GATEWAY_ADMIN_API_KEY`：
+
+```bash
+curl http://127.0.0.1:8080/admin/stats \
+  -H 'authorization: Bearer admin-secret'
+```
+
+创建一个可撤销的客户端 key：
 
 ```bash
 curl -X POST http://127.0.0.1:8080/admin/api-keys \
@@ -165,83 +139,70 @@ curl -X POST http://127.0.0.1:8080/admin/api-keys \
   -d '{"name":"my-app","request_limit":10000,"token_limit":5000000}'
 ```
 
-Limits are optional. When set, the gateway rejects requests after the request or token budget is exhausted and exposes the current limits in `/admin/api-keys` and the dashboard. Use the returned `ag_...` token in the client application:
+返回的 `ag_...` token 只展示一次。SQLite 数据默认保存到 `ai-gateway.db`，Docker Compose 会放在持久化 volume 中。
 
-```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'authorization: Bearer ag_...' \
-  -H 'content-type: application/json' \
-  -d '{"model":"auto","messages":[{"role":"user","content":"hello"}]}'
-```
+## 能力
 
-When auth is not configured, local environment mode is intentionally open on loopback. Docker binds to `0.0.0.0`, so configure `AI_GATEWAY_API_KEY` and `AI_GATEWAY_ADMIN_API_KEY` before publishing it outside the host.
+- 一个 OpenAI-compatible `/v1/chat/completions` 入口
+- OpenAI-compatible、Anthropic、Gemini、Ollama 适配器
+- 非流式和 SSE streaming，统一返回 OpenAI 格式
+- provider 优先级、模型别名、task route 和失败切换
+- provider 并发控制、超时和 cooldown
+- 可选主密钥、管理密钥、哈希客户端 key 和撤销
+- 每个身份的滑动窗口限流、请求/Token 配额
+- SQLite 用量统计、Prometheus `/metrics` 和 `/dashboard`
+- 多阶段 Docker 构建，运行时使用非 root 用户
 
-## Configuration
+## 多 Provider 与高级路由
 
-Environment variables cover the common case:
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `AI_GATEWAY_HOST` | `127.0.0.1` | Listen address in environment mode |
-| `AI_GATEWAY_PORT` | `8080` | Listen port |
-| `AI_GATEWAY_API_KEY` | unset | Application bearer key |
-| `AI_GATEWAY_ADMIN_API_KEY` | unset | Dashboard and admin bearer key |
-| `AI_GATEWAY_DATABASE` | `ai-gateway.db` | SQLite path |
-| `AI_GATEWAY_RATE_LIMIT` | `0` | Requests/minute per identity; `0` disables it |
-| `AI_GATEWAY_TIMEOUT` | `45` | Provider timeout in seconds |
-| `AI_GATEWAY_MAX_RETRIES` | `2` | Maximum failover retries |
-| `RUST_LOG` | `ai_gateway=info,tower_http=info` | Log filter |
-
-For explicit routes, headers, priorities, or multiple instances of a vendor:
+只有需要多个供应商、不同优先级或 task route 时才使用 `config.json`：
 
 ```bash
 cp config.example.json config.json
-# edit config.json
-ai-gateway --config config.json check-config
+ai-gateway check-config --config config.json
 ai-gateway --config config.json
 ```
 
-Secrets can be referenced with `api_key_env` instead of putting them in JSON. The service rejects ambiguous or invalid configuration before it binds a port.
+JSON 中的密钥建议使用 `api_key_env`，不要把真实 token 提交到仓库。`routing.model_aliases` 可以把客户端稳定名称映射到真实模型，例如 `fast` 或 `local`。
 
-Each file provider accepts `max_concurrency`; `routing.model_aliases` maps a client-facing model name to a configured provider model.
+## API
 
-## API Surface
+| 方法 | 地址 | 作用 |
+| --- | --- | --- |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible 对话和流式输出 |
+| `GET` | `/v1/models` | 已配置模型 |
+| `GET` | `/health` | provider 状态和并发槽位 |
+| `GET` | `/metrics` | Prometheus 指标 |
+| `GET` | `/dashboard` | 浏览器运营面板 |
+| `GET` | `/admin/stats` | 聚合用量 |
+| `GET/POST` | `/admin/api-keys` | 管理客户端 key |
+| `DELETE` | `/admin/api-keys/:id` | 撤销客户端 key |
 
-| Method | Endpoint | Auth | Purpose |
-| --- | --- | --- | --- |
-| `POST` | `/v1/chat/completions` | app key | OpenAI-compatible completion |
-| `GET` | `/v1/models` | app key | Configured models |
-| `GET` | `/` | none | Version and endpoint summary |
-| `GET` | `/health` | app key | Provider health and cooldown state |
-| `GET` | `/metrics` | app key | Prometheus-compatible counters |
-| `GET` | `/dashboard` | browser + admin key | Operations console |
-| `GET` | `/admin/stats` | admin key | Usage totals |
-| `GET/POST` | `/admin/api-keys` | admin key | List or create client keys |
-| `DELETE` | `/admin/api-keys/:id` | admin key | Revoke a client key |
+## 配置检查与故障排查
 
-Streaming requests use the same OpenAI-compatible SSE contract across all adapters. OpenAI-compatible providers pass through native chunks; Anthropic, Gemini, and Ollama are normalized to `chat.completion.chunk` events.
+先运行：
 
-## Build And Test
+```bash
+ai-gateway check-config
+```
 
-Requirements: Rust 1.88+ and Cargo.
+它会输出监听地址、鉴权状态和已发现的 provider，不会启动端口。常见问题：
+
+- `no provider`：检查 `AI_GATEWAY_UPSTREAM_API_KEY`，或确认 `OPENAI_API_KEY` / `OLLAMA_MODEL` 已设置。
+- `401`：设置了 `AI_GATEWAY_API_KEY` 后，请求必须带 `Authorization: Bearer ...`。
+- Docker 访问宿主机 Ollama：使用 `http://host.docker.internal:11434`，Compose 已配置映射。
+- 上游超时：调整 `AI_GATEWAY_TIMEOUT`，并检查 provider 的 base URL 是否包含正确的 `/v1`。
+
+## 开发
 
 ```bash
 cargo fmt --check
 cargo test --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo build --release --locked
+docker build --tag ai-gateway:test .
 ```
 
-Validate configuration without starting the server:
-
-```bash
-cargo run --release -- check-config --config config.json
-```
-
-## Positioning
-
-Use this project when you want a fast, self-hosted compatibility layer in front of a few providers, with routing, failover, keys, usage, and operational visibility in one binary. If you need a full multi-tenant platform with billing, account pools, quotas, and a large web control plane, use a project built for that scope and place this gateway behind it.
-
-## License
+## 许可证
 
 MIT
