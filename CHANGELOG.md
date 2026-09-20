@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+- Rewrote the runtime in Rust with Axum and Tokio for a small, high-concurrency process.
+- Kept the OpenAI-compatible API while adding native OpenAI-compatible, Anthropic, Gemini, and Ollama adapters.
+- Added provider priority routing, task routes, bounded failover, cooldowns, health reporting, and Prometheus metrics.
+- Added SQLite usage accounting, hashed managed API keys, revocation, per-key rate limits, and the operations dashboard.
+- Replaced the Python Docker image and CI pipeline with a locked Rust build and non-root Debian runtime.
+
 ## 0.2.0
 
 - Added environment-first startup with OpenAI, Anthropic, Gemini, and Ollama auto-discovery.

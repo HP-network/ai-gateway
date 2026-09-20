@@ -1,13 +1,11 @@
-__pycache__/
-*.py[cod]
 .env
 config.json
 *.db
 *.db-*
-.pytest_cache/
-.venv/
 .env.*
 !.env.example
-dist/
-build/
+target/
+__pycache__/
+*.py[cod]
 *.egg-info/
+build/

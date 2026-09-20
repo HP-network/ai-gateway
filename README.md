@@ -1,33 +1,70 @@
 # AI Gateway
 
 <p align="center">
-  <strong>One endpoint for OpenAI, Anthropic, Gemini, Ollama, and compatible providers.</strong><br>
-  Keep your app stable when models, vendors, or API keys change.
+  <strong>One fast, OpenAI-compatible endpoint for multiple LLM providers.</strong><br>
+  Route, fail over, meter, and protect your model traffic from a single Rust binary.
 </p>
 
 <p align="center">
   <a href="https://github.com/HP-network/ai-gateway/actions/workflows/ci.yml"><img src="https://github.com/HP-network/ai-gateway/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/HP-network/ai-gateway/releases"><img src="https://img.shields.io/github/v/release/HP-network/ai-gateway" alt="Release"></a>
   <a href="https://github.com/HP-network/ai-gateway/blob/main/LICENSE"><img src="https://img.shields.io/github/license/HP-network/ai-gateway" alt="License"></a>
+  <img src="https://img.shields.io/badge/runtime-Rust%20%2B%20Tokio-orange" alt="Rust and Tokio">
 </p>
 
-AI Gateway is a self-hosted LLM gateway that exposes one OpenAI-compatible API in front of several providers. It routes requests, retries failures, reports provider health, tracks usage in SQLite, and keeps provider-specific formats out of your application.
+AI Gateway keeps your application pointed at one stable API while providers, models, and credentials change behind it. It is deliberately a gateway, not a hosted billing panel: the process is small, inspectable, Docker-ready, and easy to run beside an existing app.
 
-## Start In 30 Seconds
+## Start Here
 
-You only need one provider key. No JSON file is required.
+Choose one path. You do not need a JSON file for the first two.
+
+### Docker: recommended
 
 ```bash
 git clone https://github.com/HP-network/ai-gateway.git
 cd ai-gateway
+cp .env.example .env
+# Put one provider key in .env, then:
+docker compose up -d --build
+```
 
-export OPENAI_API_KEY=sk-...
-python -m venv .venv && source .venv/bin/activate
-pip install .
+Check that it is alive:
+
+```bash
+curl http://127.0.0.1:8080/
+```
+
+### Local Rust binary
+
+```bash
+git clone https://github.com/HP-network/ai-gateway.git
+cd ai-gateway
+cp .env.example .env
+# Put OPENAI_API_KEY=sk-... (or another provider) in .env
+cargo run --release
+```
+
+For a reusable command, install it once:
+
+```bash
+cargo install --path .
 ai-gateway
 ```
 
-The local process listens on `127.0.0.1:8080` by default. Send the same request you already send to OpenAI:
+### Local Ollama
+
+```bash
+ollama pull llama3.2
+OLLAMA_MODEL=llama3.2 cargo run --release
+```
+
+The environment mode automatically enables any provider whose key is present. If no cloud key is present, it uses Ollama at `http://127.0.0.1:11434`.
+
+The binary reads a local `.env` file automatically and never overwrites variables already set by the shell. You can still use normal shell exports or a process manager in production.
+
+## Make A Request
+
+The request shape is the OpenAI Chat Completions shape, so existing SDKs only need a new `base_url`.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -38,54 +75,77 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-Existing OpenAI client code can point at the gateway by changing only `base_url`:
-
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
-answer = client.chat.completions.create(
+client = OpenAI(
+    base_url="http://127.0.0.1:8080/v1",
+    api_key="unused-unless-you-enable-gateway-auth",
+)
+
+response = client.chat.completions.create(
     model="auto",
     messages=[{"role": "user", "content": "hello"}],
 )
-print(answer.choices[0].message.content)
+print(response.choices[0].message.content)
 ```
 
-The default environment mode automatically enables any provider whose key is present:
+## Providers
 
-| Environment variable | Provider | Default model |
-| --- | --- | --- |
-| `OPENAI_API_KEY` | OpenAI-compatible | `gpt-4o-mini` |
-| `ANTHROPIC_API_KEY` | Anthropic | `claude-3-5-haiku-latest` |
-| `GEMINI_API_KEY` | Gemini | `gemini-2.0-flash` |
-| `OLLAMA_MODEL` | Local Ollama | `llama3.2` |
+| Provider | Enable with | Default model | Adapter |
+| --- | --- | --- | --- |
+| OpenAI or compatible API | `OPENAI_API_KEY` | `gpt-4o-mini` | `/chat/completions` |
+| Anthropic | `ANTHROPIC_API_KEY` | `claude-3-5-haiku-latest` | `/v1/messages` |
+| Gemini | `GEMINI_API_KEY` | `gemini-2.0-flash` | `generateContent` |
+| Ollama | `OLLAMA_MODEL` | `llama3.2` | `/api/chat` |
 
-Set `OPENAI_MODEL`, `ANTHROPIC_MODEL`, `GEMINI_MODEL`, or `OLLAMA_MODEL` to change a default. If no cloud key is present, the gateway starts with Ollama as a local provider.
+Change a model or endpoint without changing client code:
 
-Useful gateway settings:
+```bash
+OPENAI_MODEL=gpt-4.1-mini \
+OPENAI_BASE_URL=https://api.openai.com/v1 \
+OPENAI_API_KEY=sk-... \
+ai-gateway
+```
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `AI_GATEWAY_API_KEY` | unset | Shared application bearer key |
-| `AI_GATEWAY_ADMIN_API_KEY` | unset | Admin/dashboard bearer key |
-| `AI_GATEWAY_RATE_LIMIT` | `0` | Requests per minute per key; `0` disables it |
-| `AI_GATEWAY_DATABASE` | `ai-gateway.db` | SQLite database path |
-| `AI_GATEWAY_HOST` | `127.0.0.1` | Local bind address |
-| `AI_GATEWAY_PORT` | `8080` | Listen port |
+Any OpenAI-compatible vendor can be added with `OPENAI_BASE_URL`, or declared explicitly in `config.json` when several vendors must coexist.
 
-## Production Quick Start
+## What You Get
 
-For a shared deployment, set separate gateway and admin credentials. The gateway key is used by applications; the admin key creates and revokes client keys and opens the dashboard.
+- **Provider abstraction**: OpenAI-compatible, Anthropic, Gemini, and Ollama request/response normalization.
+- **Routing**: select a model, provider name, or task route; priorities define the normal order.
+- **Failover**: bounded retries and a cooldown for providers that repeatedly fail.
+- **Access control**: optional gateway/admin bearer keys plus hashed, revocable client keys.
+- **Usage accounting**: durable SQLite totals for requests, failures, latency, and tokens.
+- **Rate limits**: sliding-window limits per master or managed client key.
+- **Operations**: provider health, Prometheus text metrics, and a browser dashboard at `/dashboard`.
+- **Small runtime**: one async Rust process, rustls HTTPS, and no Python runtime in production.
+
+```mermaid
+flowchart LR
+    App[Your app / OpenAI SDK] --> Gateway[AI Gateway<br/>Axum + Tokio]
+    Gateway --> Route[Model + task routing]
+    Route --> OpenAI[OpenAI-compatible]
+    Route --> Anthropic[Anthropic]
+    Route --> Gemini[Gemini]
+    Route --> Ollama[Ollama]
+    Gateway --> Store[(SQLite usage + keys)]
+    Gateway --> Ops[/health  /metrics  /dashboard]
+```
+
+## Production Setup
+
+Set separate application and admin credentials before exposing the port:
 
 ```bash
 export OPENAI_API_KEY=sk-...
-export AI_GATEWAY_API_KEY=gateway-internal-secret
+export AI_GATEWAY_API_KEY=app-secret
 export AI_GATEWAY_ADMIN_API_KEY=admin-secret
 export AI_GATEWAY_RATE_LIMIT=120
 ai-gateway
 ```
 
-Create a client key. The plaintext token is shown only in this response, so store it in your application secret manager:
+Create a managed key. The plaintext token is returned once and is never stored or shown again:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/admin/api-keys \
@@ -94,7 +154,7 @@ curl -X POST http://127.0.0.1:8080/admin/api-keys \
   -d '{"name":"my-app"}'
 ```
 
-Use the returned `ag_...` token from then on:
+Use the returned `ag_...` token in the client application:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -103,106 +163,71 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"auto","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-Open `http://127.0.0.1:8080/dashboard` to view provider state, request totals, latency, token totals, and managed keys. The dashboard never displays key plaintext.
+When auth is not configured, local environment mode is intentionally open on loopback. Docker binds to `0.0.0.0`, so configure `AI_GATEWAY_API_KEY` and `AI_GATEWAY_ADMIN_API_KEY` before publishing it outside the host.
 
-## Docker
+## Configuration
 
-```bash
-export OPENAI_API_KEY=sk-...
-docker compose up --build
-```
+Environment variables cover the common case:
 
-Or use a local `.env` file:
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AI_GATEWAY_HOST` | `127.0.0.1` | Listen address in environment mode |
+| `AI_GATEWAY_PORT` | `8080` | Listen port |
+| `AI_GATEWAY_API_KEY` | unset | Application bearer key |
+| `AI_GATEWAY_ADMIN_API_KEY` | unset | Dashboard and admin bearer key |
+| `AI_GATEWAY_DATABASE` | `ai-gateway.db` | SQLite path |
+| `AI_GATEWAY_RATE_LIMIT` | `0` | Requests/minute per identity; `0` disables it |
+| `AI_GATEWAY_TIMEOUT` | `45` | Provider timeout in seconds |
+| `AI_GATEWAY_MAX_RETRIES` | `2` | Maximum failover retries |
+| `RUST_LOG` | `ai_gateway=info,tower_http=info` | Log filter |
 
-```bash
-cp .env.example .env
-# edit .env, then:
-docker compose up --build
-```
-
-The container uses the same environment-first setup and publishes port `8080`. SQLite data is kept in the `ai-gateway-data` volume. Set `AI_GATEWAY_ADMIN_API_KEY` to enable key management and the dashboard:
-
-```bash
-export AI_GATEWAY_API_KEY=gateway-secret
-export AI_GATEWAY_ADMIN_API_KEY=admin-secret
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H "authorization: Bearer $AI_GATEWAY_API_KEY" \
-  -H 'content-type: application/json' \
-  -d '{"messages":[{"role":"user","content":"hello"}]}'
-```
-
-The Compose service includes a healthcheck on `/`. For a direct `docker run`, set `AI_GATEWAY_HOST=0.0.0.0` so the published port is reachable from outside the container.
-
-## What It Does
-
-- **One stable API**: OpenAI-compatible `/v1/chat/completions` and `/v1/models`.
-- **Provider adapters**: OpenAI-compatible APIs, Anthropic Messages, Gemini `generateContent`, and Ollama.
-- **Routing**: choose by provider name, model, or task; priority determines the default order.
-- **Failover**: bounded retries and a cooldown for providers that keep failing.
-- **Operations**: `/health`, `/v1/health`, Prometheus-compatible `/metrics`, and a built-in dashboard.
-- **Usage and access**: SQLite request/token totals, hashed managed keys, revocation, and per-identity rate limits.
-- **Security basics**: separate gateway/admin bearer credentials and environment-based provider secrets.
-- **Small footprint**: Python standard library at runtime, Docker-ready, no framework lock-in.
-
-## Advanced Configuration
-
-Environment mode is the recommended starting point. Use a JSON file when you need explicit task routes, priorities, custom headers, or several models from the same vendor:
+For explicit routes, headers, priorities, or multiple instances of a vendor:
 
 ```bash
 cp config.example.json config.json
+# edit config.json
+ai-gateway --config config.json check-config
 ai-gateway --config config.json
 ```
 
-Example task routing:
+Secrets can be referenced with `api_key_env` instead of putting them in JSON. The service rejects ambiguous or invalid configuration before it binds a port.
 
-```json
-{
-  "routing": {
-    "max_retries": 2,
-    "failure_cooldown_seconds": 30,
-    "task_routes": {
-      "code": ["openai", "local-ollama"],
-      "chat": ["anthropic", "openai"]
-    }
-  }
-}
-```
+## API Surface
 
-Validate a file before deploying it:
+| Method | Endpoint | Auth | Purpose |
+| --- | --- | --- | --- |
+| `POST` | `/v1/chat/completions` | app key | OpenAI-compatible completion |
+| `GET` | `/v1/models` | app key | Configured models |
+| `GET` | `/` | none | Version and endpoint summary |
+| `GET` | `/health` | app key | Provider health and cooldown state |
+| `GET` | `/metrics` | app key | Prometheus-compatible counters |
+| `GET` | `/dashboard` | browser + admin key | Operations console |
+| `GET` | `/admin/stats` | admin key | Usage totals |
+| `GET/POST` | `/admin/api-keys` | admin key | List or create client keys |
+| `DELETE` | `/admin/api-keys/:id` | admin key | Revoke a client key |
 
-```bash
-ai-gateway check-config --config config.json
-```
+Streaming is intentionally rejected in `0.3.0` so every adapter has the same predictable response contract. The next compatibility milestone is provider-native streaming with a consistent SSE layer.
 
-## API Endpoints
+## Build And Test
 
-| Method | Endpoint | Purpose |
-| --- | --- | --- |
-| `POST` | `/v1/chat/completions` | OpenAI-compatible chat completion |
-| `GET` | `/v1/models` | Models currently configured |
-| `GET` | `/` | Service information and endpoint links |
-| `GET` | `/health` | Gateway and provider health |
-| `GET` | `/metrics` | Request counters and latency |
-| `GET` | `/dashboard` | Browser dashboard |
-| `GET` | `/admin/stats` | Usage totals (admin key required) |
-| `GET` | `/admin/api-keys` | Managed key metadata (admin key required) |
-| `POST` | `/admin/api-keys` | Create a managed key (admin key required) |
-| `DELETE` | `/admin/api-keys/:id` | Revoke a managed key (admin key required) |
-
-Streaming is intentionally rejected for now so every adapter has consistent, predictable behavior. Non-streaming completions work across all providers.
-
-## Scope
-
-AI Gateway is infrastructure, not a hosted-service panel. It deliberately keeps the runtime small and inspectable while covering the operational basics: one endpoint, provider adapters, routing, failover, health, usage, keys, rate limits, and a small administration UI. It does not attempt to replace a billing or multi-tenant SaaS platform.
-
-## Development
+Requirements: Rust 1.88+ and Cargo.
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests -v
-python -m py_compile src/ai_gateway/*.py
+cargo fmt --check
+cargo test --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo build --release --locked
 ```
 
-The code is split into configuration, provider adapters, routing, and the HTTP service so it can be embedded behind another server or extended with a new provider without changing client integrations.
+Validate configuration without starting the server:
+
+```bash
+cargo run --release -- check-config --config config.json
+```
+
+## Positioning
+
+Use this project when you want a fast, self-hosted compatibility layer in front of a few providers, with routing, failover, keys, usage, and operational visibility in one binary. If you need a full multi-tenant platform with billing, account pools, quotas, and a large web control plane, use a project built for that scope and place this gateway behind it.
 
 ## License
 

@@ -21,11 +21,14 @@ services:
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
       GEMINI_BASE_URL: ${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-}
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      RUST_LOG: ${RUST_LOG:-ai_gateway=info,tower_http=info}
     volumes:
       - ai-gateway-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=3)"]
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/"]
       interval: 30s
       timeout: 5s
       retries: 3
